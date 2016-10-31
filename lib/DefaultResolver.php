@@ -255,17 +255,22 @@ REGEX;
             $uri = $this->parseCustomServerUri($options["server"]);
         }
 
+        $resultArr = [];
+
         foreach ($types as $type) {
-            $promises[] = $this->doRequest($uri, $name, $type);
+            $promises[] = $this->doRequest($uri, $name, $type)->when(static function($error, $result) use(&$resultArr) {
+                if ($result !== null) {
+                    $resultArr[] = $result;
+                }
+            });
         }
 
         try {
-            list( , $resultArr) = (yield \Amp\timeout(\Amp\some($promises), $timeout));
-            foreach ($resultArr as $value) {
-                $result += $value;
-            }
+            yield \Amp\timeout(\Amp\some($promises), $timeout);
         } catch (\Amp\TimeoutException $e) {
-            if (substr($uri, 0, 6) == "tcp://") {
+            if (!empty($resultArr)) {
+                // fall through
+            } else if (substr($uri, 0, 6) == "tcp://") {
                 throw new TimeoutException(
                     "Name resolution timed out for {$name}"
                 );
@@ -287,6 +292,10 @@ REGEX;
                 }
                 throw new ResolutionException("All name resolution requests failed", 0, $e);
             }
+        }
+
+        foreach ($resultArr as $value) {
+            $result += $value;
         }
 
         yield new CoroutineResult($result);
