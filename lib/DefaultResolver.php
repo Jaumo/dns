@@ -462,14 +462,11 @@ REGEX;
         $server->buffer = "";
         $server->length = INF;
         $server->pendingRequests = [];
-        $server->watcherId = \Amp\onReadable($socket, $this->makePrivateCallable("onReadable"), [
-            "enable" => true,
-            "keep_alive" => true,
-        ]);
         $this->serverIdMap[$id] = $server;
         $this->serverUriMap[$uri] = $server;
 
         if (substr($uri, 0, 6) == "tcp://") {
+            $onReadable = "onTcpReadable";
             $promisor = new Deferred;
             $server->connect = $promisor->promise();
             $watcher = \Amp\onWritable($server->socket, static function($watcher) use ($server, $promisor, &$timer) {
@@ -483,7 +480,14 @@ REGEX;
                 $this->unloadServer($id);
                 $promisor->fail(new TimeoutException("Name resolution timed out, could not connect to server at $uri"));
             }, 5000);
+        } else {
+            $onReadable = "onUdpReadable";
         }
+
+        $server->watcherId = \Amp\onReadable($socket, $this->makePrivateCallable($onReadable), [
+            "enable" => true,
+            "keep_alive" => true,
+        ]);
 
         return $server;
     }
@@ -511,34 +515,37 @@ REGEX;
         }
     }
 
-    private function onReadable($watcherId, $socket) {
+    private function onTcpReadable($watcherId, $socket) {
         $serverId = (int) $socket;
         $packet = @\fread($socket, 512);
         if ($packet != "") {
             $server = $this->serverIdMap[$serverId];
-            if (\substr($server->uri, 0, 6) == "tcp://") {
-                if ($server->length == INF) {
-                    $server->length = unpack("n", $packet)[1];
-                    $packet = substr($packet, 2);
+            if ($server->length == INF) {
+                $server->length = unpack("n", $packet)[1];
+                $packet = substr($packet, 2);
+            }
+            $server->buffer .= $packet;
+            while ($server->length <= \strlen($server->buffer)) {
+                $this->decodeResponsePacket($serverId, substr($server->buffer, 0, $server->length));
+                $server->buffer = substr($server->buffer, $server->length);
+                if (\strlen($server->buffer) >= 2 + $server->length) {
+                    $server->length = unpack("n", $server->buffer)[1];
+                    $server->buffer = substr($server->buffer, 2);
+                } else {
+                    $server->length = INF;
                 }
-                $server->buffer .= $packet;
-                while ($server->length <= \strlen($server->buffer)) {
-                    $this->decodeResponsePacket($serverId, substr($server->buffer, 0, $server->length));
-                    $server->buffer = substr($server->buffer, $server->length);
-                    if (\strlen($server->buffer) >= 2 + $server->length) {
-                        $server->length = unpack("n", $server->buffer)[1];
-                        $server->buffer = substr($server->buffer, 2);
-                    } else {
-                        $server->length = INF;
-                    }
-                }
-            } else {
-                $this->decodeResponsePacket($serverId, $packet);
             }
         } else {
             $this->unloadServer($serverId, new ResolutionException(
                 "Server connection failed"
             ));
+        }
+    }
+
+    private function onUdpReadable($watcherId, $socket) {
+        $serverId = (int) $socket;
+        while (false !== $packet = @\stream_socket_recvfrom($socket, 512)) {
+            $this->decodeResponsePacket($serverId, $packet);
         }
     }
 
