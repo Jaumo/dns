@@ -3,12 +3,14 @@
 namespace Amp\Dns;
 
 use Amp\Cache\ArrayCache;
+use Amp\Cache\Cache;
 use Amp\CombinatorException;
 use Amp\CoroutineResult;
 use Amp\Deferred;
 use Amp\Failure;
 use Amp\File\FilesystemException;
 use Amp\Success;
+use Amp\TimeoutException as AmpTimeoutException;
 use Amp\WindowsRegistry\KeyNotFoundException;
 use Amp\WindowsRegistry\WindowsRegistry;
 use LibDNS\Decoder\DecoderFactory;
@@ -17,12 +19,28 @@ use LibDNS\Messages\MessageFactory;
 use LibDNS\Messages\MessageTypes;
 use LibDNS\Records\QuestionFactory;
 
-class DefaultResolver implements Resolver {
+class DefaultResolver implements Resolver
+{
+    const RESOLV_CONF_PATH = '/etc/resolv.conf';
+    const HOSTS_FILE_PATH = '/etc/hosts';
+    const HOSTS_FILE_PATH_WIN = 'C:\Windows\system32\drivers\etc\hosts';
+
+    private $defaultServerConfig = [
+        "nameservers" => [
+            "8.8.8.8:53",
+            "8.8.4.4:53",
+        ],
+        "timeout" => 3000,
+        "attempts" => 2,
+    ];
+
+    private static $isWindows;
+
     private $messageFactory;
     private $questionFactory;
     private $encoder;
     private $decoder;
-    private $arrayCache;
+    private $cache;
     private $requestIdCounter;
     private $pendingRequests;
     private $serverIdMap;
@@ -30,14 +48,32 @@ class DefaultResolver implements Resolver {
     private $serverIdTimeoutMap;
     private $now;
     private $serverTimeoutWatcher;
-    private $config;
+    private $systemServerConfig;
+    private $systemServerConfigLoadPromise;
+    private $hostsFileData;
+    private $hostsFileLoadPromise;
+    private $udpSocket;
+    private $defaultServerList = [];
 
-    public function __construct() {
+    /** @var Server[] */
+    private $servers = [];
+
+    private function getServer($address)
+    {
+        if (!isset($this->servers[$address])) {
+            $this->servers[$address] = new Server($address, $this->messageFactory);
+        }
+
+        return $this->servers[$address];
+    }
+
+    public function __construct(Cache $cache = null)
+    {
         $this->messageFactory = new MessageFactory;
         $this->questionFactory = new QuestionFactory;
         $this->encoder = (new EncoderFactory)->create();
         $this->decoder = (new DecoderFactory)->create();
-        $this->arrayCache = new ArrayCache;
+        $this->cache = isset($cache) ? $cache : new ArrayCache;
         $this->requestIdCounter = 1;
         $this->pendingRequests = [];
         $this->serverIdMap = [];
@@ -58,43 +94,296 @@ class DefaultResolver implements Resolver {
             "enable" => true,
             "keep_alive" => false,
         ]);
+        self::$isWindows = \stripos(PHP_OS, "win") === 0;
     }
 
     /**
      * {@inheritdoc}
      */
-    public function resolve($name, array $options = []) {
-        if (!$inAddr = @\inet_pton($name)) {
-            if ($this->isValidHostName($name)) {
-                $types = empty($options["types"]) ? [Record::A, Record::AAAA] : (array) $options["types"];
-                return $this->pipeResult($this->recurseWithHosts($name, $types, $options), $types);
-            } else {
-                return new Failure(new ResolutionException("Cannot resolve; invalid host name"));
-            }
-        } else {
+    public function resolve($name, array $options = [])
+    {
+        if ($inAddr = @\inet_pton($name)) {
             return new Success([[$name, isset($inAddr[4]) ? Record::AAAA : Record::A, $ttl = null]]);
         }
+
+        if (!\Amp\Dns\isValidHostName($name)) {
+            return new Failure(new ResolutionException('Cannot resolve; invalid host name'));
+        }
+
+        $types = [];
+
+        foreach (empty($options['types']) ? [Record::A, Record::AAAA] : (array)$options['types'] as $type) {
+            if ($type !== Record::A && $type !== Record::AAAA) {
+                return new Failure(new ResolutionException(
+                    'resolve() may only be used to lookup A and AAAA records, use query() for advanced lookups'
+                ));
+            }
+
+            $types[$type] = $type;
+        }
+
+        return $this->flattenResults(\Amp\resolve($this->resolveName(strtolower($name), $types, $options)), $types);
     }
 
     /**
-     * {$inheritdoc}
+     * {@inheritdoc}
      */
-    public function query($name, $type, array $options = []) {
-        $handler = [$this, empty($options["recurse"]) ?  "doResolve" : "doRecurse"];
-        $types = (array) $type;
-        return $this->pipeResult(\Amp\resolve($handler($name, $types, $options)), $types);
+    public function query($name, $type, array $options = [])
+    {
+        return $this->flattenResults(\Amp\resolve(
+            empty($options['recurse'])
+                ? $this->doResolve(strtolower($name), [$type], $options)
+                : $this->doRecurse(strtolower($name), [$type], $options)
+        ), [$type]);
     }
 
-    private function isValidHostName($name) {
-        $pattern = <<<'REGEX'
-/^(?<name>[a-z0-9]([a-z0-9-]*[a-z0-9])?)(\.(?&name))*$/i
-REGEX;
+    private function resolveName($name, $types, $options)
+    {
+        $records = [];
+        $promises = [];
+        $haveRecords = false;
 
-        return !isset($name[253]) && \preg_match($pattern, $name);
+        foreach ($types as $type) {
+            $promises[$type] = \Amp\resolve($this->resolveNameLocally($name, $type, $options));
+        }
+
+        foreach ((yield \Amp\all($promises)) as $type => $result) {
+            if ($result !== null) {
+                $haveRecords = !empty($records[$type] = $result) || $haveRecords;
+                unset($types[$type]);
+            }
+        }
+
+        if (empty($types)) {
+            if (!$haveRecords) {
+                throw new NoRecordException("No records returned for {$name} (cached result)");
+            }
+
+            yield new CoroutineResult($records);
+            return;
+        }
+
+        $questions = [];
+
+        foreach ($types as $type) {
+            $question = $this->questionFactory->create($type);
+            $question->setName($name);
+            $questions[$type] = $question;
+        }
+
+        foreach ((yield $this->getServerListForRequest($options)) as $serverInfo) {
+            $result = (yield \Amp\resolve($this->sendQuestionsToServer($serverInfo[0], $serverInfo[1], $questions, $options)));
+
+            foreach ($result as $type => $recordSet) {
+
+            }
+        }
+    }
+
+    private function sendQuestionsToServer(Server $server, $protocols, $questions, $options)
+    {
+        // not allowed to use TCP, just go straight to UDP and give up on failure
+        if (!($protocols & Server::PROTOCOL_TCP)) {
+            return $this->sendQuestionsToServerOverUdp($server, $questions, $options);
+        }
+
+        // not allowed to use UDP, just go straight to TCP and give up on failure
+        if (!($protocols & Server::PROTOCOL_UDP)) {
+            return $this->sendQuestionsToServerOverTcp($server, $questions, $options);
+        }
+
+        // tried and failed to connect TCP, just go straight to UDP and give up on failure
+        if ($server->tcpConnectFailed) {
+            return $this->sendQuestionsToServerOverUdp($server, $questions, $options);
+        }
+
+        // already have a TCP connection, try and use it but fall back to UDP
+        if ($server->haveEstablishedTcpSocket) {
+            return $this->sendQuestionsToServerOverTcpWithUdpFallback($server, $questions, $options);
+        }
+
+        // waiting for a TCP connect to complete or no sockets yet, try UDP first then TCP
+        return $this->sendQuestionsToServerOverUdpWithTcpFallback($server, $questions, $options);
+    }
+
+    public function sendQuestionsToServerOverTcp(Server $server, $questions, $options)
+    {
+        // todo
+    }
+
+    public function sendQuestionsToServerOverTcpWithUdpFallback(Server $server, $questions, $options)
+    {
+        // todo
+    }
+
+    public function sendQuestionsToServerOverUdp(Server $server, $questions, $options)
+    {
+        // make sure only one packet is sent until we get the first response
+        if ($server->udpPromise !== null) {
+            yield $server->udpPromise;
+        } else if (!$server->haveEstablishedUdpSocket) {
+            $deferred = new Deferred;
+            $server->udpPromise = $deferred->promise();
+        }
+
+        list($request, $promise) = $server->buildUdpRequest($questions);
+
+        $socket = $this->getUdpSocket();
+        \stream_socket_sendto($socket, $this->encoder->encode($request), 0, $server->address);
+
+        try {
+            $timeout = empty($options['timeout'])
+                ? $this->systemServerConfig['timeout']
+                : (int)$options['timeout'];
+
+            $response = (yield \Amp\timeout($promise, $timeout));
+        } catch (AmpTimeoutException $e) {
+            $server->cancelUdpRequest($request);
+
+            $e = new TimeoutException('Request timed out after ' . $timeout . 'ms');
+
+            if (isset($deferred)) {
+                $deferred->fail($e);
+            }
+
+            throw $e;
+        }
+
+        if (isset($deferred)) {
+            $deferred->succeed();
+            $server->udpPromise = null;
+        }
+
+        yield new CoroutineResult($response);
+    }
+
+    public function sendQuestionsToServerOverUdpWithTcpFallback(Server $server, $questions, $options)
+    {
+        try {
+            $result = (yield \Amp\resolve($this->sendQuestionsToServerOverUdp($server, $questions, $options)));
+
+            if ($server->tcpSocket === null && !$server->tcpConnectFailed) {
+                // we know the server is there, try and initiate a TCP connection we can use for future requests
+                // but don't wait for it, we don't need it right now
+                $this->setUpTcpSocket($server);
+            }
+
+            yield new CoroutineResult($result);
+            return;
+        } catch (\Exception $e) {
+            // todo
+        }
+    }
+
+    public function setUpTcpSocket(Server $server)
+    {
+        if ($server->tcpConnectPromise !== null) {
+            yield $server->tcpConnectPromise;
+            return;
+        }
+
+        $deferred = new Deferred;
+    }
+
+    /**
+     * @uses onUdpReadable
+     */
+    private function getUdpSocket()
+    {
+        if ($this->udpSocket === null) {
+            // single socket used for all UDP communication, use fake remote address
+            $this->udpSocket = stream_socket_client('udp://11.11.11.11:11', $errNo, $errStr);
+            \Amp\onReadable($this->udpSocket, $this->makePrivateCallable('onUdpReadable'));
+        }
+
+        return $this->udpSocket;
+    }
+
+    private function onUdpReadable()
+    {
+        $packet = \stream_socket_recvfrom($this->udpSocket, 1024, 0, $address);
+
+        $portPos = \strrpos($address, ':');
+        if (\strpos($address, ':') !== $portPos) {
+            // ipv6 addresses returned by recvfrom are not wrapped in []
+            $address = '[' . \substr($address, 0, $portPos) . ']' . \substr($address, $portPos);
+        }
+
+        $this->servers[$address]->finalizeUdpRequest($this->decoder->decode($packet));
+    }
+
+    private function getServerListForRequest($options)
+    {
+        if (!empty($options['server'])) {
+            try {
+                return new Success([$this->parseCustomServerUri($options['server'])]);
+            } catch (\Exception $e) {
+                return new Failure($e);
+            }
+        }
+
+        if (isset($this->systemServerConfig)) {
+            return new Success($this->defaultServerList);
+        }
+
+        $deferred = new Deferred;
+
+        $this->loadSystemServerConfig()->when(function($error, $result) use($deferred) {
+            if ($error) {
+                $deferred->fail($error);
+            } else if (empty($result['nameservers'])) {
+                $deferred->fail(new ResolutionException('No nameserver specified in system config'));
+            } else {
+                $this->systemServerConfig = $result;
+
+                foreach ($result['nameservers'] as $host) {
+                    $this->defaultServerList[] = [$this->getServer("{$host}:53"), Server::PROTOCOL_ANY];
+                }
+
+                $deferred->succeed($this->defaultServerList);
+            }
+        });
+
+        return $deferred->promise();
+    }
+
+    private function resolveNameLocally($name, $type, $options)
+    {
+        // Check hosts file
+        if (!isset($options["hosts"]) || $options["hosts"]) {
+            $result = (yield \Amp\resolve($this->lookupNameInHostsFile($name, $type, !empty($options["reload_hosts"]))));
+
+            if (!empty($result)) {
+                yield new CoroutineResult($result);
+                return;
+            }
+        }
+
+        $result = null;
+
+        // Check cache
+        if (!isset($options["cache"]) || $options["cache"]) {
+            $result = (yield $this->cache->get("$name#$type"));
+        }
+
+        yield new CoroutineResult($result);
+    }
+
+    private function lookupNameInHostsFile($name, $type, $reload)
+    {
+        if (!isset($this->hostsFileData) || $reload) {
+            $this->hostsFileData = (yield $this->loadHostsFile());
+        }
+
+        yield new CoroutineResult(
+            isset($this->hostsFileData[$type][$name])
+                ? [$this->hostsFileData[$type][$name], $type, $ttl = null]
+                : null
+        );
     }
 
     // flatten $result while preserving order according to $types (append unspecified types for e.g. Record::ALL queries)
-    private function pipeResult($promise, array $types) {
+    private function flattenResults($promise, array $types) {
         return \Amp\pipe($promise, function (array $result) use ($types) {
             $retval = [];
             foreach ($types as $type) {
@@ -105,32 +394,6 @@ REGEX;
             }
             return $result ? \array_merge($retval, \call_user_func_array("array_merge", $result)) : $retval;
         });
-    }
-
-    private function recurseWithHosts($name, array $types, $options) {
-        // Check for hosts file matches
-        if (!isset($options["hosts"]) || $options["hosts"]) {
-            static $hosts = null;
-            if ($hosts === null || !empty($options["reload_hosts"])) {
-                return \Amp\pipe(\Amp\resolve($this->loadHostsFile()), function ($value) use (&$hosts, $name, $types, $options) {
-                    unset($options["reload_hosts"]); // avoid recursion
-                    $hosts = $value;
-                    return $this->recurseWithHosts($name, $types, $options);
-                });
-            }
-            $result = [];
-            if (in_array(Record::A, $types) && isset($hosts[Record::A][$name])) {
-                $result[Record::A] = [[$hosts[Record::A][$name], Record::A, $ttl = null]];
-            }
-            if (in_array(Record::AAAA, $types) && isset($hosts[Record::AAAA][$name])) {
-                $result[Record::AAAA] = [[$hosts[Record::AAAA][$name], Record::AAAA, $ttl = null]];
-            }
-            if ($result) {
-                return new Success($result);
-            }
-        }
-
-        return \Amp\resolve($this->doRecurse($name, $types, $options));
     }
 
     private function doRecurse($name, array $types, $options) {
@@ -210,8 +473,8 @@ REGEX;
     }
 
     private function doResolve($name, array $types, $options) {
-        if (!$this->config) {
-            $this->config = (yield \Amp\resolve($this->loadResolvConf()));
+        if (!$this->systemServerConfig) {
+            $this->systemServerConfig = (yield \Amp\resolve($this->loadSystemServerConfig()));
         }
 
         if (empty($types)) {
@@ -228,7 +491,7 @@ REGEX;
         if (!isset($options["cache"]) || $options["cache"]) {
             foreach ($types as $k => $type) {
                 $cacheKey = "$name#$type";
-                $cacheValue = (yield $this->arrayCache->get($cacheKey));
+                $cacheValue = (yield $this->cache->get($cacheKey));
 
                 if ($cacheValue !== null) {
                     $result[$type] = $cacheValue;
@@ -245,17 +508,19 @@ REGEX;
             }
         }
 
-        $timeout = empty($options["timeout"]) ? $this->config["timeout"] : (int) $options["timeout"];
+        $timeout = empty($options["timeout"]) ? $this->systemServerConfig["timeout"] : (int) $options["timeout"];
 
         if (empty($options["server"])) {
-            if (empty($this->config["nameservers"])) {
+            if (empty($this->systemServerConfig["nameservers"])) {
                 throw new ResolutionException("No nameserver specified in system config");
             }
 
-            $uri = "udp://" . $this->config["nameservers"][0];
+            $uri = "udp://" . $this->systemServerConfig["nameservers"][0];
         } else {
             $uri = $this->parseCustomServerUri($options["server"]);
         }
+
+        $promises = [];
 
         foreach ($types as $type) {
             $promises[] = $this->doRequest($uri, $name, $type);
@@ -266,7 +531,7 @@ REGEX;
             foreach ($resultArr as $value) {
                 $result += $value;
             }
-        } catch (\Amp\TimeoutException $e) {
+        } catch (TimeoutException $e) {
             if (substr($uri, 0, 6) == "tcp://") {
                 throw new TimeoutException(
                     "Name resolution timed out for {$name}"
@@ -295,105 +560,131 @@ REGEX;
     }
 
     /** @link http://man7.org/linux/man-pages/man5/resolv.conf.5.html */
-    private function loadResolvConf($path = null) {
-        $result = [
-            "nameservers" => [
-                "8.8.8.8:53",
-                "8.8.4.4:53",
-            ],
-            "timeout" => 3000,
-            "attempts" => 2,
-        ];
+    private function loadResolvConf($path)
+    {
+        $result = $this->defaultServerConfig;
 
-        if (\stripos(PHP_OS, "win") !== 0 || $path !== null) {
-            $path = $path ?: "/etc/resolv.conf";
+        try {
+            $lines = explode("\n", (yield \Amp\File\get($path)));
+            $result["nameservers"] = [];
 
-            try {
-                $lines = explode("\n", (yield \Amp\File\get($path)));
-                $result["nameservers"] = [];
+            foreach ($lines as $line) {
+                $line = \preg_split('#\s+#', $line, 2);
 
-                foreach ($lines as $line) {
-                    $line = \preg_split('#\s+#', $line, 2);
-                    if (\count($line) !== 2) {
+                if (\count($line) !== 2) {
+                    continue;
+                }
+
+                list($type, $value) = $line;
+
+                if ($type === "nameserver") {
+                    $line[1] = trim($line[1]);
+                    $ip = @\inet_pton($line[1]);
+
+                    if ($ip === false) {
                         continue;
                     }
 
-                    list($type, $value) = $line;
-                    if ($type === "nameserver") {
-                        $line[1] = trim($line[1]);
-                        $ip = @\inet_pton($line[1]);
+                    if (isset($ip[15])) {
+                        $result["nameservers"][] = "[" . $line[1] . "]:53";
+                    } else {
+                        $result["nameservers"][] = $line[1] . ":53";
+                    }
+                } else if ($type === "options") {
+                    $optline = preg_split('#\s+#', $value, 2);
+                    if (\count($optline) !== 2) {
+                        continue;
+                    }
 
-                        if ($ip === false) {
-                            continue;
-                        }
+                    // TODO: Respect the contents of the attempts setting during resolution
 
-                        if (isset($ip[15])) {
-                            $result["nameservers"][] = "[" . $line[1] . "]:53";
-                        } else {
-                            $result["nameservers"][] = $line[1] . ":53";
-                        }
-                    } elseif ($type === "options") {
-                        $optline = preg_split('#\s+#', $value, 2);
-                        if (\count($optline) !== 2) {
-                            continue;
-                        }
-
-                        // TODO: Respect the contents of the attempts setting during resolution
-
-                        list($option, $value) = $optline;
-                        if (in_array($option, ["timeout", "attempts"])) {
-                            $result[$option] = (int) $value;
-                        }
+                    list($option, $value) = $optline;
+                    if (in_array($option, ["timeout", "attempts"])) {
+                        $result[$option] = (int) $value;
                     }
                 }
-            } catch (FilesystemException $e) {
-                // use default
             }
-        } else if (\stripos(PHP_OS, "win") === 0) {
-            $keys = [
-                "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\NameServer",
-                "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\DhcpNameServer",
-            ];
-
-            $reader = new WindowsRegistry;
-            $nameserver = "";
-
-            while ($nameserver === "" && ($key = array_shift($keys))) {
-                try {
-                    $nameserver = (yield $reader->read($key));
-                } catch (KeyNotFoundException $e) { }
-            }
-
-            if ($nameserver === "") {
-                $subKeys = (yield $reader->listKeys("HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces"));
-
-                while ($nameserver === "" && ($key = array_shift($subKeys))) {
-                    try {
-                        $nameserver = (yield $reader->read("{$key}\\NameServer"));
-                    } catch (KeyNotFoundException $e) { }
-                }
-            }
-
-            if ($nameserver !== "") {
-                // Microsoft documents space as delimiter, AppVeyor uses comma.
-                $result["nameservers"] = array_map(function ($ns) {
-                    return trim($ns) . ":53";
-                }, explode(" ", strtr($nameserver, ",", " ")));
-            } else {
-                throw new ResolutionException("Could not find a nameserver in the Windows Registry.");
-            }
+        } catch (FilesystemException $e) {
+            // use default
         }
 
         yield new CoroutineResult($result);
     }
 
-    private function loadHostsFile($path = null) {
-        $data = [];
-        if (empty($path)) {
-            $path = \stripos(PHP_OS, "win") === 0
-                ? 'C:\Windows\system32\drivers\etc\hosts'
-                : '/etc/hosts';
+    private function loadWindowsRegistryConfig()
+    {
+        $result = $this->defaultServerConfig;
+        $keys = [
+            'HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\NameServer',
+            'HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\DhcpNameServer',
+        ];
+
+        $reader = new WindowsRegistry;
+        $server = '';
+
+        while ($server === '' && ($key = array_shift($keys))) {
+            try {
+                $server = (yield $reader->read($key));
+            } catch (KeyNotFoundException $e) { }
         }
+
+        if ($server === '') {
+            $subKeys = (yield $reader->listKeys('HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces'));
+
+            while ($server === '' && ($key = array_shift($subKeys))) {
+                try {
+                    $server = (yield $reader->read($key . '\NameServer'));
+                } catch (KeyNotFoundException $e) { }
+            }
+        }
+
+        if ($server === '') {
+            throw new ResolutionException('Could not find a nameserver in the Windows Registry.');
+        }
+
+        // Microsoft documents space as delimiter, AppVeyor uses comma.
+        $result['nameservers'] = array_map(function ($ns) {
+            return trim($ns) . ':53';
+        }, explode(' ', strtr($server, ',', ' ')));
+
+        yield new CoroutineResult($result);
+    }
+
+    private function loadSystemServerConfig($path = null) {
+        if ($this->systemServerConfigLoadPromise !== null) {
+            return $this->systemServerConfigLoadPromise;
+        }
+
+        $generator = self::$isWindows && $path == null
+            ? $this->loadWindowsRegistryConfig()
+            : $this->loadResolvConf($path ?: self::RESOLV_CONF_PATH);
+
+        return $this->systemServerConfigLoadPromise = \Amp\resolve($generator)->when(function () {
+            $this->systemServerConfigLoadPromise = null;
+        });
+    }
+
+    private function loadHostsFile($path = null)
+    {
+        if ($this->hostsFileLoadPromise !== null) {
+            return $this->hostsFileLoadPromise;
+        }
+
+        if (empty($path)) {
+            $path = self::$isWindows
+                ? self::HOSTS_FILE_PATH_WIN
+                : self::HOSTS_FILE_PATH;
+        }
+
+        return $this->hostsFileLoadPromise = \Amp\resolve($this->doLoadHostsFile($path))->when(function () {
+            $this->hostsFileLoadPromise = null;
+        });
+    }
+
+    private function doLoadHostsFile($path)
+    {
+        $data = [];
+
         try {
             $contents = (yield \Amp\File\get($path));
         } catch (\Exception $e) {
@@ -401,64 +692,82 @@ REGEX;
             return;
         }
 
-        $lines = \array_filter(\array_map("trim", \explode("\n", $contents)));
-        foreach ($lines as $line) {
-            if ($line[0] === "#") {
+        foreach (\array_filter(\array_map('trim', \explode("\n", $contents))) as $line) {
+            if ($line[0] === '#') {
                 continue;
             }
+
             $parts = \preg_split('/\s+/', $line);
+
             if (!($ip = @\inet_pton($parts[0]))) {
                 continue;
-            } elseif (isset($ip[4])) {
+            } else if (isset($ip[4])) {
                 $key = Record::AAAA;
             } else {
                 $key = Record::A;
             }
+
             for ($i = 1, $l = \count($parts); $i < $l; $i++) {
-                if ($this->isValidHostName($parts[$i])) {
+                if (\Amp\Dns\isValidHostName($parts[$i])) {
                     $data[$key][strtolower($parts[$i])] = $parts[0];
                 }
             }
         }
 
         // Windows does not include localhost in its host file. Fetch it from the system instead
-        if (!isset($data[Record::A]["localhost"]) && !isset($data[Record::AAAA]["localhost"])) {
+        if (!isset($data[Record::A]['localhost']) && !isset($data[Record::AAAA]['localhost'])) {
             // PHP currently provides no way to **resolve** IPv6 hostnames (not even with fallback)
-            $local = gethostbyname("localhost");
-            if ($local !== "localhost") {
-                $data[Record::A]["localhost"] = $local;
+            $local = gethostbyname('localhost');
+
+            if ($local !== 'localhost') {
+                $data[Record::A]['localhost'] = $local;
             } else {
-                $data[Record::AAAA]["localhost"] = "::1";
+                $data[Record::AAAA]['localhost'] = '::1';
             }
         }
 
         yield new CoroutineResult($data);
     }
 
-    private function parseCustomServerUri($uri) {
+    private function parseCustomServerUri($uri)
+    {
         if (!\is_string($uri)) {
             throw new ResolutionException(
                 'Invalid server address ($uri must be a string IP address, ' . gettype($uri) . " given)"
             );
         }
-        if (strpos($uri, "://") !== false) {
-            return $uri;
-        }
-        if (($colonPos = strrpos($uri, ":")) !== false) {
-            $addr = \substr($uri, 0, $colonPos);
-            $port = \substr($uri, $colonPos + 1);
+
+        $parts = explode('://', $uri);
+
+        if (isset($parts[1])) {
+            $protocol = $parts[0];
+            $addr = $parts[1];
         } else {
-            $addr = $uri;
-            $port = 53;
-        }
-        $addr = trim($addr, "[]");
-        if (!$inAddr = @\inet_pton($addr)) {
-            throw new ResolutionException(
-                'Invalid server $uri; string IP address required'
-            );
+            $protocol = null;
+            $addr = $parts[0];
         }
 
-        return isset($inAddr[4]) ? "udp://[{$addr}]:{$port}" : "udp://{$addr}:{$port}";
+        if (($colonPos = strrpos($addr, ':')) !== false) {
+            $host = \substr($addr, 0, $colonPos);
+            $port = (int)\substr($addr, $colonPos + 1);
+        } else {
+            $host = $addr;
+            $port = 53;
+        }
+
+        if (!$inAddr = @\inet_pton(\trim($host))) {
+            throw new ResolutionException('Invalid server $uri; string IP address required');
+        }
+
+        $protocols = Server::PROTOCOL_ANY;
+
+        if ($protocol === 'udp') {
+            $protocols &= ~Server::PROTOCOL_TCP;
+        } else if ($protocol === 'tcp') {
+            $protocols &= ~Server::PROTOCOL_TCP;
+        }
+
+        return [$this->getServer("{$host}:{$port}"), $protocols];
     }
 
     private function loadExistingServer($uri) {
@@ -623,7 +932,7 @@ REGEX;
             $result[$record->getType()][] = [(string) $record->getData(), $record->getType(), $record->getTTL()];
         }
         if (empty($result)) {
-            $this->arrayCache->set("$name#$type", [], 300); // "it MUST NOT cache it for longer than five (5) minutes" per RFC 2308 section 7.1
+            $this->cache->set("$name#$type", [], 300); // "it MUST NOT cache it for longer than five (5) minutes" per RFC 2308 section 7.1
             $this->finalizeResult($serverId, $requestId, new NoRecordException(
                 "No records returned for {$name}"
             ));
@@ -658,7 +967,7 @@ REGEX;
                         $minttl = $ttl;
                     }
                 }
-                $this->arrayCache->set("$name#$type", $records, $minttl);
+                $this->cache->set("$name#$type", $records, $minttl);
             }
             $promisor->succeed($result);
         }

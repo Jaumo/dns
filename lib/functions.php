@@ -72,3 +72,16 @@ function resolve($name, array $options = []) {
 function query($name, $type, array $options = []) {
     return resolver()->query($name, $type, $options);
 }
+
+/**
+ * Check whether a string is a valid DNS name.
+ *
+ * RFC 1035 Section 2.3.4
+ *
+ * @param string $name
+ * @return bool
+ */
+function isValidHostName($name) {
+    $pattern = '/^(?<name>[a-z0-9][a-z0-9-]{0,62}(?<!-))(\.(?&name))*$/i';
+    return !isset($name[254]) && \preg_match($pattern, $name);
+}

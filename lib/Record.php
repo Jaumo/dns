@@ -2,4 +2,6 @@
 
 namespace Amp\Dns;
 
-class Record extends \LibDNS\Records\ResourceQTypes {}
+use LibDNS\Records\ResourceQTypes;
+
+class Record extends ResourceQTypes {}
