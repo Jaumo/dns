@@ -61,17 +61,18 @@ class DefaultResolver implements Resolver
     private $defaultServerList = [];
     private $pendingResolveLookups = [];
 
-
     /** @var Server[] */
     private $servers = [];
 
     private function getServer($address, $addressFamily)
     {
-        if (!isset($this->servers[$address])) {
-            $this->servers[$address] = new Server($address, $addressFamily, $this->messageFactory, $this->encoder, $this->decoder);
+        $key = "{$address}#{$addressFamily}";
+
+        if (!isset($this->servers[$key])) {
+            $this->servers[$key] = new Server($address, $addressFamily, $this->messageFactory, $this->encoder, $this->decoder);
         }
 
-        return $this->servers[$address];
+        return $this->servers[$key];
     }
 
     public function __construct(Cache $cache = null)
@@ -192,9 +193,19 @@ class DefaultResolver implements Resolver
 
         foreach ((yield $this->getServerListForRequest($options)) as $serverInfo) {
             try {
+                $server = $serverInfo['server'];
+                $protocols = $serverInfo['protocols'];
+                $key = $serverInfo['key'];
+
                 /** @var Message $result */
-                $result = (yield \Amp\resolve($this->sendQuestionsToServer($serverInfo[0], $serverInfo[1], $questions, $options)));
+                $result = (yield \Amp\resolve($this->sendQuestionsToServer($server, $protocols, $questions, $options)));
             } catch (\Exception $e) {
+                // if a request fails for one of the system default servers, move it to the end of the list
+                if ($key !== null) {
+                    unset($this->defaultServerList[$key]);
+                    $this->defaultServerList[$key] = $serverInfo;
+                }
+
                 continue;
             }
 
@@ -209,7 +220,8 @@ class DefaultResolver implements Resolver
                 $records[$type][] = [(string)$record->getData(), $type, $record->getTTL()];
             }
 
-            break;
+            yield new CoroutineResult($records);
+            return;
         }
     }
 
@@ -459,7 +471,11 @@ class DefaultResolver implements Resolver
                     }
 
                     $key = "{$host}:53";
-                    $this->defaultServerList[$key] = [$this->getServer($key, $addressFamily), Server::PROTOCOL_ANY];
+                    $this->defaultServerList[$key] = [
+                        'server'    => $this->getServer($key, $addressFamily),
+                        'protocols' => Server::PROTOCOL_ANY,
+                        'key'       => $key,
+                    ];
                 }
 
                 if (empty($this->defaultServerList)) {
@@ -522,170 +538,11 @@ class DefaultResolver implements Resolver
         });
     }
 
-    private function doRecurse($name, array $types, $options) {
-        if (array_intersect($types, [Record::CNAME, Record::DNAME])) {
-            throw new ResolutionException("Cannot use recursion for CNAME and DNAME records");
-        }
-
-        $types = array_merge($types, [Record::CNAME, Record::DNAME]);
-        $lookupName = $name;
-        for ($i = 0; $i < 30; $i++) {
-            $result = (yield \Amp\resolve($this->doResolve($lookupName, $types, $options)));
-            if (count($result) > isset($result[Record::CNAME]) + isset($result[Record::DNAME])) {
-                unset($result[Record::CNAME], $result[Record::DNAME]);
-                yield new CoroutineResult($result);
-                return;
-            }
-            // @TODO check for potentially using recursion and iterate over *all* CNAME/DNAME
-            // @FIXME check higher level for CNAME?
-            foreach ([Record::CNAME, Record::DNAME] as $type) {
-                if (isset($result[$type])) {
-                    list($lookupName) = $result[$type][0];
-                }
-            }
-        }
-
-        throw new ResolutionException("CNAME or DNAME chain too long (possible recursion?)");
-    }
-
-    private function doRequest($uri, $name, $type) {
-        $server = $this->loadExistingServer($uri) ?: $this->loadNewServer($uri);
-
-        $useTCP = substr($uri, 0, 6) == "tcp://";
-        if ($useTCP && isset($server->connect)) {
-            return \Amp\pipe($server->connect, function() use ($uri, $name, $type) {
-                return $this->doRequest($uri, $name, $type);
-            });
-        }
-
-        // Get the next available request ID
-        do {
-            $requestId = $this->requestIdCounter++;
-            if ($this->requestIdCounter >= MAX_REQUEST_ID) {
-                $this->requestIdCounter = 1;
-            }
-        } while (isset($this->pendingRequests[$requestId]));
-
-        // Create question record
-        $question = $this->questionFactory->create($type);
-        $question->setName($name);
-
-        // Create request message
-        $request = $this->messageFactory->create(MessageTypes::QUERY);
-        $request->getQuestionRecords()->add($question);
-        $request->isRecursionDesired(true);
-        $request->setID($requestId);
-
-        // Encode request message
-        $requestPacket = $this->encoder->encode($request);
-
-        if ($useTCP) {
-            $requestPacket = pack("n", strlen($requestPacket)) . $requestPacket;
-        }
-
-        // Send request
-        $bytesWritten = \fwrite($server->socket, $requestPacket);
-        if ($bytesWritten === false || isset($packet[$bytesWritten])) {
-            throw new ResolutionException(
-                "Request send failed"
-            );
-        }
-
-        $promisor = new Deferred;
-        $server->pendingRequests[$requestId] = true;
-        $this->pendingRequests[$requestId] = [$promisor, $name, $type, $uri];
-
-        return $promisor->promise();
-    }
-
-    private function doResolve($name, array $types, $options) {
-        if (!$this->systemServerConfig) {
-            $this->systemServerConfig = (yield \Amp\resolve($this->loadSystemServerConfig()));
-        }
-
-        if (empty($types)) {
-            yield new CoroutineResult([]);
-            return;
-        }
-
-        assert(array_reduce($types, function ($result, $val) { return $result && \is_int($val); }, true), 'The $types passed to DNS functions must all be integers (from \Amp\Dns\Record class)');
-
-        $name = \strtolower($name);
-        $result = [];
-
-        // Check for cache hits
-        if (!isset($options["cache"]) || $options["cache"]) {
-            foreach ($types as $k => $type) {
-                $cacheKey = "$name#$type";
-                $cacheValue = (yield $this->cache->get($cacheKey));
-
-                if ($cacheValue !== null) {
-                    $result[$type] = $cacheValue;
-                    unset($types[$k]);
-                }
-            }
-            if (empty($types)) {
-                if (empty(array_filter($result))) {
-                    throw new NoRecordException("No records returned for {$name} (cached result)");
-                } else {
-                    yield new CoroutineResult($result);
-                    return;
-                }
-            }
-        }
-
-        $timeout = empty($options["timeout"]) ? $this->systemServerConfig["timeout"] : (int) $options["timeout"];
-
-        if (empty($options["server"])) {
-            if (empty($this->systemServerConfig["nameservers"])) {
-                throw new ResolutionException("No nameserver specified in system config");
-            }
-
-            $uri = "udp://" . $this->systemServerConfig["nameservers"][0];
-        } else {
-            $uri = $this->parseCustomServerUri($options["server"]);
-        }
-
-        $promises = [];
-
-        foreach ($types as $type) {
-            $promises[] = $this->doRequest($uri, $name, $type);
-        }
-
-        try {
-            list( , $resultArr) = (yield \Amp\timeout(\Amp\some($promises), $timeout));
-            foreach ($resultArr as $value) {
-                $result += $value;
-            }
-        } catch (TimeoutException $e) {
-            if (substr($uri, 0, 6) == "tcp://") {
-                throw new TimeoutException(
-                    "Name resolution timed out for {$name}"
-                );
-            } else {
-                $options["server"] = \preg_replace("#[a-z.]+://#", "tcp://", $uri);
-                yield new CoroutineResult(\Amp\resolve($this->doResolve($name, $types, $options)));
-                return;
-            }
-        } catch (ResolutionException $e) {
-            if (empty($result)) { // if we have no cached results
-                throw $e;
-            }
-        } catch (CombinatorException $e) { // if all promises in Amp\some fail
-            if (empty($result)) { // if we have no cached results
-                foreach ($e->getExceptions() as $ex) {
-                    if ($ex instanceof NoRecordException) {
-                        throw new NoRecordException("No records returned for {$name}", 0, $e);
-                    }
-                }
-                throw new ResolutionException("All name resolution requests failed", 0, $e);
-            }
-        }
-
-        yield new CoroutineResult($result);
-    }
-
-    /** @link http://man7.org/linux/man-pages/man5/resolv.conf.5.html */
+    /**
+     * @link http://man7.org/linux/man-pages/man5/resolv.conf.5.html
+     * @param string $path
+     * @return \Generator
+     */
     private function loadResolvConf($path)
     {
         $result = $this->defaultServerConfig;
@@ -901,10 +758,183 @@ class DefaultResolver implements Resolver
         if ($protocol === 'udp') {
             $protocols &= ~Server::PROTOCOL_TCP;
         } else if ($protocol === 'tcp') {
-            $protocols &= ~Server::PROTOCOL_TCP;
+            $protocols &= ~Server::PROTOCOL_UDP;
         }
 
-        return [$this->getServer("{$host}:{$port}", $addressFamily), $protocols];
+        return [
+            'server'    => $this->getServer("{$host}:{$port}", $addressFamily),
+            'protocols' => $protocols,
+            'key'       => null
+        ];
+    }
+
+    /**
+     * @todo
+     * below this point is old stuff that I have not touched. Some of it is redundant, some of it needs to be
+     * reimplemented, some of it just needs killing.
+     */
+
+    private function doRecurse($name, array $types, $options) {
+        if (array_intersect($types, [Record::CNAME, Record::DNAME])) {
+            throw new ResolutionException("Cannot use recursion for CNAME and DNAME records");
+        }
+
+        $types = array_merge($types, [Record::CNAME, Record::DNAME]);
+        $lookupName = $name;
+        for ($i = 0; $i < 30; $i++) {
+            $result = (yield \Amp\resolve($this->doResolve($lookupName, $types, $options)));
+            if (count($result) > isset($result[Record::CNAME]) + isset($result[Record::DNAME])) {
+                unset($result[Record::CNAME], $result[Record::DNAME]);
+                yield new CoroutineResult($result);
+                return;
+            }
+            // @TODO check for potentially using recursion and iterate over *all* CNAME/DNAME
+            // @FIXME check higher level for CNAME?
+            foreach ([Record::CNAME, Record::DNAME] as $type) {
+                if (isset($result[$type])) {
+                    list($lookupName) = $result[$type][0];
+                }
+            }
+        }
+
+        throw new ResolutionException("CNAME or DNAME chain too long (possible recursion?)");
+    }
+
+    private function doRequest($uri, $name, $type) {
+        $server = $this->loadExistingServer($uri) ?: $this->loadNewServer($uri);
+
+        $useTCP = substr($uri, 0, 6) == "tcp://";
+        if ($useTCP && isset($server->connect)) {
+            return \Amp\pipe($server->connect, function() use ($uri, $name, $type) {
+                return $this->doRequest($uri, $name, $type);
+            });
+        }
+
+        // Get the next available request ID
+        do {
+            $requestId = $this->requestIdCounter++;
+            if ($this->requestIdCounter >= MAX_REQUEST_ID) {
+                $this->requestIdCounter = 1;
+            }
+        } while (isset($this->pendingRequests[$requestId]));
+
+        // Create question record
+        $question = $this->questionFactory->create($type);
+        $question->setName($name);
+
+        // Create request message
+        $request = $this->messageFactory->create(MessageTypes::QUERY);
+        $request->getQuestionRecords()->add($question);
+        $request->isRecursionDesired(true);
+        $request->setID($requestId);
+
+        // Encode request message
+        $requestPacket = $this->encoder->encode($request);
+
+        if ($useTCP) {
+            $requestPacket = pack("n", strlen($requestPacket)) . $requestPacket;
+        }
+
+        // Send request
+        $bytesWritten = \fwrite($server->socket, $requestPacket);
+        if ($bytesWritten === false || isset($packet[$bytesWritten])) {
+            throw new ResolutionException(
+                "Request send failed"
+            );
+        }
+
+        $promisor = new Deferred;
+        $server->pendingRequests[$requestId] = true;
+        $this->pendingRequests[$requestId] = [$promisor, $name, $type, $uri];
+
+        return $promisor->promise();
+    }
+
+    private function doResolve($name, array $types, $options) {
+        if (!$this->systemServerConfig) {
+            $this->systemServerConfig = (yield \Amp\resolve($this->loadSystemServerConfig()));
+        }
+
+        if (empty($types)) {
+            yield new CoroutineResult([]);
+            return;
+        }
+
+        assert(array_reduce($types, function ($result, $val) { return $result && \is_int($val); }, true), 'The $types passed to DNS functions must all be integers (from \Amp\Dns\Record class)');
+
+        $name = \strtolower($name);
+        $result = [];
+
+        // Check for cache hits
+        if (!isset($options["cache"]) || $options["cache"]) {
+            foreach ($types as $k => $type) {
+                $cacheKey = "$name#$type";
+                $cacheValue = (yield $this->cache->get($cacheKey));
+
+                if ($cacheValue !== null) {
+                    $result[$type] = $cacheValue;
+                    unset($types[$k]);
+                }
+            }
+            if (empty($types)) {
+                if (empty(array_filter($result))) {
+                    throw new NoRecordException("No records returned for {$name} (cached result)");
+                } else {
+                    yield new CoroutineResult($result);
+                    return;
+                }
+            }
+        }
+
+        $timeout = empty($options["timeout"]) ? $this->systemServerConfig["timeout"] : (int) $options["timeout"];
+
+        if (empty($options["server"])) {
+            if (empty($this->systemServerConfig["nameservers"])) {
+                throw new ResolutionException("No nameserver specified in system config");
+            }
+
+            $uri = "udp://" . $this->systemServerConfig["nameservers"][0];
+        } else {
+            $uri = $this->parseCustomServerUri($options["server"]);
+        }
+
+        $promises = [];
+
+        foreach ($types as $type) {
+            $promises[] = $this->doRequest($uri, $name, $type);
+        }
+
+        try {
+            list( , $resultArr) = (yield \Amp\timeout(\Amp\some($promises), $timeout));
+            foreach ($resultArr as $value) {
+                $result += $value;
+            }
+        } catch (TimeoutException $e) {
+            if (substr($uri, 0, 6) == "tcp://") {
+                throw new TimeoutException(
+                    "Name resolution timed out for {$name}"
+                );
+            } else {
+                $options["server"] = \preg_replace("#[a-z.]+://#", "tcp://", $uri);
+                yield new CoroutineResult(\Amp\resolve($this->doResolve($name, $types, $options)));
+                return;
+            }
+        } catch (ResolutionException $e) {
+            if (empty($result)) { // if we have no cached results
+                throw $e;
+            }
+        } catch (CombinatorException $e) { // if all promises in Amp\some fail
+            if (empty($result)) { // if we have no cached results
+                foreach ($e->getExceptions() as $ex) {
+                    if ($ex instanceof NoRecordException) {
+                        throw new NoRecordException("No records returned for {$name}", 0, $e);
+                    }
+                }
+                throw new ResolutionException("All name resolution requests failed", 0, $e);
+            }
+        }
+
+        yield new CoroutineResult($result);
     }
 
     private function loadExistingServer($uri) {
