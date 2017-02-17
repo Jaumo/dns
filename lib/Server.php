@@ -1,4 +1,4 @@
-<?php declare(strict_types = 1);
+<?php
 
 namespace Amp\Dns;
 
@@ -20,8 +20,8 @@ class Server
     private $encoder;
     private $decoder;
 
-    private $udpRequestIdCounter = 0;
-    private $tcpRequestIdCounter = 0;
+    private $udpRequestIdCounter = 1;
+    private $tcpRequestIdCounter = 1;
     private $pendingUdpRequestDeferreds = [];
     private $pendingTcpRequestDeferreds = [];
 
@@ -54,13 +54,10 @@ class Server
         $this->decoder = $decoder;
     }
 
-    private function buildRequest($questions, $id)
+    private function buildRequest($question, $id)
     {
         $request = $this->messageFactory->create(MessageTypes::QUERY);
-
-        foreach ($questions as $question) {
-            $request->getQuestionRecords()->add($question);
-        }
+        $request->getQuestionRecords()->add($question);
 
         $request->isRecursionDesired(true);
         $request->setID($id);
@@ -68,7 +65,7 @@ class Server
         return $request;
     }
 
-    public function buildUdpRequest($questions)
+    public function buildUdpRequest($question)
     {
         do {
             $id = $this->udpRequestIdCounter++;
@@ -79,7 +76,7 @@ class Server
 
         $this->pendingUdpRequestDeferreds[$id] = new Deferred;
 
-        return [$this->buildRequest($questions, $id), $this->pendingUdpRequestDeferreds[$id]->promise()];
+        return [$this->buildRequest($question, $id), $this->pendingUdpRequestDeferreds[$id]->promise()];
     }
 
     public function finalizeUdpRequest(Message $message)
@@ -117,11 +114,16 @@ class Server
 
         $this->pendingTcpRequestDeferreds[$id] = new Deferred;
 
-        $data = $this->encoder->encode($this->buildRequest($questions, $id));
-        $length = \strlen($data);
+        $data = '';
+        $length = 0;
 
-        $data = \pack('n', $length) . $data;
-        $length += 2;
+        foreach ($questions as $question) {
+            $requestData = $this->encoder->encode($this->buildRequest($question, $id));
+            $length = \strlen($requestData);
+
+            $data .= \pack('n', $length) . $requestData;
+            $length += 2;
+        }
 
         if (\fwrite($this->socket, $data) !== $length) {
             $this->writeQueue[] = [$data, $length];
@@ -161,6 +163,8 @@ class Server
             throw new SocketException("Failed to create TCP socket for {$this->address}: {$errStr}", $errNo);
         }
 
+        \stream_set_blocking($sock, false);
+
         $this->writeWatcherId = \Amp\onWritable($sock, function() use($deferred, $sock) {
             \Amp\cancel($this->writeWatcherId);
             \Amp\cancel($this->connectTimeoutWatcherId);
@@ -175,7 +179,9 @@ class Server
             $this->writeWatcherId = $this->connectTimeoutWatcherId = $this->connectPromise = null;
         });
 
-        $this->connectTimeoutWatcherId = \Amp\once(function() use($deferred) {
+        $this->connectTimeoutWatcherId = \Amp\once(function() use($deferred, $sock) {
+            fclose($sock);
+
             \Amp\cancel($this->writeWatcherId);
 
             $deferred->fail(new TimeoutException("TCP connection to {$this->address} failed"));

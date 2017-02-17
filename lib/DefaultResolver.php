@@ -29,8 +29,8 @@ class DefaultResolver implements Resolver
 
     private $defaultServerConfig = [
         "nameservers" => [
-            "8.8.8.8:53",
-            "8.8.4.4:53",
+            "8.8.8.8",
+            "8.8.4.4",
         ],
         "timeout" => 3000,
         "attempts" => 2,
@@ -66,13 +66,11 @@ class DefaultResolver implements Resolver
 
     private function getServer($address, $addressFamily)
     {
-        $key = "{$address}#{$addressFamily}";
-
-        if (!isset($this->servers[$key])) {
-            $this->servers[$key] = new Server($address, $addressFamily, $this->messageFactory, $this->encoder, $this->decoder);
+        if (!isset($this->servers[$address])) {
+            $this->servers[$address] = new Server($address, $addressFamily, $this->messageFactory, $this->encoder, $this->decoder);
         }
 
-        return $this->servers[$key];
+        return $this->servers[$address];
     }
 
     public function __construct(Cache $cache = null)
@@ -80,7 +78,7 @@ class DefaultResolver implements Resolver
         $this->messageFactory = new MessageFactory;
         $this->questionFactory = new QuestionFactory;
         $this->encoder = (new EncoderFactory)->create();
-        $this->decoder = (new DecoderFactory)->create();
+        $this->decoder = (new DecoderFactory)->create(null, true);
         $this->cache = isset($cache) ? $cache : new ArrayCache;
         $this->requestIdCounter = 1;
         $this->pendingRequests = [];
@@ -197,8 +195,8 @@ class DefaultResolver implements Resolver
                 $protocols = $serverInfo['protocols'];
                 $key = $serverInfo['key'];
 
-                /** @var Message $result */
-                $result = (yield \Amp\resolve($this->sendQuestionsToServer($server, $protocols, $questions, $options)));
+                /** @var Message[] $results */
+                $results = (yield \Amp\resolve($this->sendQuestionsToServer($server, $protocols, $questions, $options)));
             } catch (\Exception $e) {
                 // if a request fails for one of the system default servers, move it to the end of the list
                 if ($key !== null) {
@@ -210,14 +208,16 @@ class DefaultResolver implements Resolver
             }
 
             /** @var ResourceRecord $record */
-            foreach ($result->getAnswerRecords() as $record) {
-                $type = $record->getType();
+            foreach ($results as $result) {
+                foreach ($result->getAnswerRecords() as $record) {
+                    $type = $record->getType();
 
-                if (!isset($types[$type])) {
-                    continue; // todo: handle other record types properly
+                    if (!isset($types[$type])) {
+                        continue; // todo: handle other record types properly
+                    }
+
+                    $records[$type][] = [(string)$record->getData(), $type, $record->getTTL()];
                 }
-
-                $records[$type][] = [(string)$record->getData(), $type, $record->getTTL()];
             }
 
             yield new CoroutineResult($records);
@@ -261,15 +261,22 @@ class DefaultResolver implements Resolver
             $server->udpConnectPromise = $deferred->promise();
         }
 
-        list($request, $promise) = $server->buildUdpRequest($questions);
+        reset($questions);
+        $firstKey = key($questions);
+        $firstQuestion = $questions[$firstKey];
+        unset($questions[$firstKey]);
+
+        list($request, $promise) = $server->buildUdpRequest($firstQuestion);
         $this->sendUdpMessage($request, $server);
+
+        $responses = [];
 
         try {
             $timeout = empty($options['timeout'])
                 ? $this->systemServerConfig['timeout']
                 : (int)$options['timeout'];
 
-            $response = (yield \Amp\timeout($promise, $timeout));
+            $responses[$firstKey] = (yield \Amp\timeout($promise, $timeout));
         } catch (AmpTimeoutException $e) {
             $server->cancelUdpRequest($request);
 
@@ -288,7 +295,23 @@ class DefaultResolver implements Resolver
             $server->udpConnectPromise = null;
         }
 
-        yield new CoroutineResult($response);
+        $promises = [];
+
+        foreach ($questions as $key => $question) {
+            list($request, $promise) = $server->buildUdpRequest($question);
+            $this->sendUdpMessage($request, $server);
+
+            $promises[$key] = $promise;
+        }
+
+        try {
+            $responses = array_merge($responses, (yield \Amp\timeout(\Amp\all($promises), $timeout)));
+        } catch (AmpTimeoutException $e) {
+            $server->cancelUdpRequest($request);
+            throw new TimeoutException('Request timed out after ' . $timeout . 'ms');
+        }
+
+        yield new CoroutineResult($responses);
     }
 
     public function sendQuestionsToServerOverTcp(Server $server, $questions, $options)
@@ -343,6 +366,7 @@ class DefaultResolver implements Resolver
                 $server->connectTcpSocket();
             }
         } catch (\Exception $e) {
+            echo $e;
             /* todo: may need some handling of specific exceptions? */
             $result = (yield \Amp\resolve($this->sendQuestionsToServerOverTcp($server, $questions, $options)));
         }
@@ -360,8 +384,16 @@ class DefaultResolver implements Resolver
         // A single socket is use for all UDP communication (one each for IPv4 and IPv6)
         // UDP socket creation is an atomic operation, no benefit to STREAM_CLIENT_ASYNC_CONNECT
 
-        if (!$this->udpSockets[STREAM_PF_INET] = @\stream_socket_client('udp://127.0.0.1:11', $errNo, $errStr)) {
-            throw new SocketException('Error creating UDP socket for IPv4 communication: ' . $errStr, $errNo);
+        // Try and find a port that we can bind to
+        for ($port = 56211; $port > 40000; $port--) {
+            if ($socket = @\stream_socket_server('udp://0.0.0.0:' . $port, $errNo, $errStr, STREAM_SERVER_BIND)) {
+                $this->udpSockets[STREAM_PF_INET] = $socket;
+                break;
+            }
+        }
+
+        if (!$this->udpSockets[STREAM_PF_INET]) {
+            throw new SocketException('Error creating UDP socket for IPv4 communication');
         }
 
         \stream_set_blocking($this->udpSockets[STREAM_PF_INET], 0);
@@ -369,7 +401,8 @@ class DefaultResolver implements Resolver
         $this->udpWritableCallbacks[STREAM_PF_INET] = function() { $this->onUdpWritable(STREAM_PF_INET); };
 
         // Don't throw if we can't create an IPv6 socket, as some machines may not support it
-        if ($this->udpSockets[STREAM_PF_INET6] = @\stream_socket_client('udp://[::1]:11') ?: null) {
+        if ($socket = @\stream_socket_server('udp://[::]:' . $port, $errNo, $errStr, STREAM_SERVER_BIND) ?: null) {
+            $this->udpSockets[STREAM_PF_INET6] = $socket;
             \stream_set_blocking($this->udpSockets[STREAM_PF_INET6], 0);
             \Amp\onReadable($this->udpSockets[STREAM_PF_INET6], $this->makePrivateCallable('onIPv6UdpReadable'));
             $this->udpWritableCallbacks[STREAM_PF_INET6] = function() { $this->onUdpWritable(STREAM_PF_INET6); };
@@ -398,6 +431,7 @@ class DefaultResolver implements Resolver
 
     private function onIPv4UdpReadable()
     {
+        var_dump(__METHOD__);
         $packet = \stream_socket_recvfrom($this->udpSockets[STREAM_PF_INET], 1024, 0, $address);
 
         $this->servers[$address]->finalizeUdpRequest($this->decoder->decode($packet));
@@ -564,14 +598,8 @@ class DefaultResolver implements Resolver
                     $line[1] = trim($line[1]);
                     $ip = @\inet_pton($line[1]);
 
-                    if ($ip === false) {
-                        continue;
-                    }
-
-                    if (isset($ip[15])) {
-                        $result["nameservers"][] = "[" . $line[1] . "]:53";
-                    } else {
-                        $result["nameservers"][] = $line[1] . ":53";
+                    if ($ip !== false) {
+                        $result["nameservers"][] = $line[1];
                     }
                 } else if ($type === "options") {
                     $optline = preg_split('#\s+#', $value, 2);
@@ -627,7 +655,7 @@ class DefaultResolver implements Resolver
 
         // Microsoft documents space as delimiter, AppVeyor uses comma.
         $result['nameservers'] = array_map(function ($ns) {
-            return trim($ns) . ':53';
+            return trim($ns);
         }, explode(' ', strtr($server, ',', ' ')));
 
         yield new CoroutineResult($result);
