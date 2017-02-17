@@ -3,7 +3,6 @@
 namespace Amp\Dns;
 
 use Amp\Deferred;
-use Amp\TimeoutException as AmpTimeoutException;
 use LibDNS\Decoder\Decoder;
 use LibDNS\Encoder\Encoder;
 use LibDNS\Messages\Message;
@@ -23,6 +22,10 @@ class Server
     private $udpRequestIdCounter = 1;
     private $tcpRequestIdCounter = 1;
     private $pendingUdpRequestDeferreds = [];
+
+    /**
+     * @var Deferred[]
+     */
     private $pendingTcpRequestDeferreds = [];
 
     private $readWatcherId;
@@ -44,10 +47,19 @@ class Server
     public $haveEstablishedTcpSocket = false;
     public $tcpConnectFailed = false;
 
-    public function __construct($address, $addressFamily, MessageFactory $messageFactory, Encoder $encoder, Decoder $decoder)
-    {
+    public $defaultTimeout;
+
+    public function __construct(
+        $address,
+        $addressFamily,
+        $defaultTimeout,
+        MessageFactory $messageFactory,
+        Encoder $encoder,
+        Decoder $decoder
+    ) {
         $this->address = $address;
         $this->addressFamily = $addressFamily;
+        $this->defaultTimeout = $defaultTimeout;
 
         $this->messageFactory = $messageFactory;
         $this->encoder = $encoder;
@@ -69,6 +81,7 @@ class Server
     {
         do {
             $id = $this->udpRequestIdCounter++;
+
             if ($this->udpRequestIdCounter >= MAX_REQUEST_ID) {
                 $this->udpRequestIdCounter = 1;
             }
@@ -103,10 +116,11 @@ class Server
         unset($this->pendingUdpRequestDeferreds[$id]);
     }
 
-    public function sendTcpRequest($questions, $timeout)
+    private function addQuestionToWriteQueue($question)
     {
         do {
             $id = $this->tcpRequestIdCounter++;
+
             if ($this->tcpRequestIdCounter >= MAX_REQUEST_ID) {
                 $this->tcpRequestIdCounter = 1;
             }
@@ -114,31 +128,45 @@ class Server
 
         $this->pendingTcpRequestDeferreds[$id] = new Deferred;
 
-        $data = '';
-        $length = 0;
+        $data = $this->encoder->encode($this->buildRequest($question, $id));
+        $length = \strlen($data);
+        $data = \pack('n', $length) . $data;
 
-        foreach ($questions as $question) {
-            $requestData = $this->encoder->encode($this->buildRequest($question, $id));
-            $length = \strlen($requestData);
+        $this->writeQueue[] = [$id, $data, $length + 2];
 
-            $data .= \pack('n', $length) . $requestData;
-            $length += 2;
+        return [$id, $this->pendingTcpRequestDeferreds[$id]->promise()];
+    }
+
+    public function sendTcpRequest($questions, $timeout)
+    {
+        $promises = [];
+        $ids = [];
+
+        foreach ($questions as $type => $question) {
+            list($id, $promise) = $this->addQuestionToWriteQueue($question);
+
+            $ids[$type] = $id;
+            $promises[$type] = \Amp\timeout($promise, $timeout);
         }
 
-        if (\fwrite($this->socket, $data) !== $length) {
-            $this->writeQueue[] = [$data, $length];
-
-            if (!isset($this->writeWatcherId)) {
-                $this->writeWatcherId = \Amp\onWritable($this->socket, $this->onWritable);
-            }
+        if (!isset($this->writeWatcherId)) {
+            $this->writeWatcherId = \Amp\onWritable($this->socket, $this->onWritable);
         }
 
-        return \Amp\timeout($this->pendingTcpRequestDeferreds[$id]->promise(), $timeout)
-            ->when(function($error) use($id, $timeout) {
-                if ($error instanceof AmpTimeoutException) {
-                    $this->pendingTcpRequestDeferreds[$id]->fail($error);
+        $deferred = new Deferred;
+
+        /** @noinspection PhpUnusedParameterInspection */
+        \Amp\any($promises)
+            ->when(function($null, $results) use($ids, $deferred) {
+                foreach ($results[0] as $type => $error) {
+                    // timed out requests will still have a pending deferred
+                    unset($this->pendingTcpRequestDeferreds[$ids[$type]]);
                 }
+
+                $deferred->succeed($results[1]);
             });
+
+        return $deferred->promise();
     }
 
     /**
@@ -198,9 +226,15 @@ class Server
     private function onWritable()
     {
         while (!empty($this->writeQueue)) {
-            list($data, $length) = $this->writeQueue[0];
+            list($id, $data, $length) = $this->writeQueue[0];
 
-            if (\fwrite($this->socket, $data) !== $length) {
+            if ($length !== $written = \fwrite($this->socket, $data)) {
+                if ($written === false) {
+                    $this->pendingTcpRequestDeferreds[$id]->fail(new SocketException('TCP write failed'));
+                    unset($this->pendingTcpRequestDeferreds[$id]);
+                }
+
+                $this->writeQueue[0] = [\substr($data, $written), $length - $written];
                 return;
             }
 
@@ -254,9 +288,9 @@ class Server
         }
 
         $receivedLength = \strlen($data);
+        $this->readBuffer .= $data;
 
         if ($receivedLength < $this->currentBytesRemaining) {
-            $this->readBuffer .= $data;
             $this->currentBytesRemaining -= $receivedLength;
             return;
         }

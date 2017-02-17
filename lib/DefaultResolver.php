@@ -64,10 +64,13 @@ class DefaultResolver implements Resolver
     /** @var Server[] */
     private $servers = [];
 
-    private function getServer($address, $addressFamily)
+    private function getServer($address, $addressFamily, $defaultTimeout)
     {
         if (!isset($this->servers[$address])) {
-            $this->servers[$address] = new Server($address, $addressFamily, $this->messageFactory, $this->encoder, $this->decoder);
+            $this->servers[$address] = new Server(
+                $address, $addressFamily, $defaultTimeout,
+                $this->messageFactory, $this->encoder, $this->decoder
+            );
         }
 
         return $this->servers[$address];
@@ -251,7 +254,7 @@ class DefaultResolver implements Resolver
         return $this->sendQuestionsToServerOverUdpWithTcpFallback($server, $questions, $options);
     }
 
-    public function sendQuestionsToServerOverUdp(Server $server, $questions, $options)
+    private function sendQuestionsToServerOverUdp(Server $server, $questions, $options)
     {
         // make sure only one packet is sent until we get the first response
         if ($server->udpConnectPromise !== null) {
@@ -272,9 +275,9 @@ class DefaultResolver implements Resolver
         $responses = [];
 
         try {
-            $timeout = empty($options['timeout'])
-                ? $this->systemServerConfig['timeout']
-                : (int)$options['timeout'];
+            $timeout = !empty($options['timeout'])
+                ? (int)$options['timeout']
+                : $server->defaultTimeout;
 
             $responses[$firstKey] = (yield \Amp\timeout($promise, $timeout));
         } catch (AmpTimeoutException $e) {
@@ -314,7 +317,7 @@ class DefaultResolver implements Resolver
         yield new CoroutineResult($responses);
     }
 
-    public function sendQuestionsToServerOverTcp(Server $server, $questions, $options)
+    private function sendQuestionsToServerOverTcp(Server $server, $questions, $options)
     {
         if ($server->tcpConnectFailed) {
             throw new ResolutionException("TCP failed to connect for {$server->address}");
@@ -325,40 +328,34 @@ class DefaultResolver implements Resolver
         }
 
         try {
-            $timeout = empty($options['timeout'])
-                ? $this->systemServerConfig['timeout']
-                : (int)$options['timeout'];
+            $timeout = !empty($options['timeout'])
+                ? (int)$options['timeout']
+                : $server->defaultTimeout;
 
-            $response = (yield \Amp\timeout($server->sendTcpRequest($questions, $timeout), $timeout));
+            $responses = (yield $server->sendTcpRequest($questions, $timeout));
         } catch (AmpTimeoutException $e) {
-            $e = new TimeoutException('Request timed out after ' . $timeout . 'ms');
-
-            if (isset($deferred)) {
-                $deferred->fail($e);
-            }
-
-            throw $e;
+            throw new TimeoutException('Request timed out after ' . $timeout . 'ms');
         }
 
-        yield new CoroutineResult($response);
+        yield new CoroutineResult($responses);
     }
 
-    public function sendQuestionsToServerOverTcpWithUdpFallback(Server $server, $questions, $options)
+    private function sendQuestionsToServerOverTcpWithUdpFallback(Server $server, $questions, $options)
     {
         try {
-            $result = (yield \Amp\resolve($this->sendQuestionsToServerOverTcp($server, $questions, $options)));
+            $responses = (yield \Amp\resolve($this->sendQuestionsToServerOverTcp($server, $questions, $options)));
         } catch (\Exception $e) {
             /* todo: may need some handling of specific exceptions? */
-            $result = (yield \Amp\resolve($this->sendQuestionsToServerOverUdp($server, $questions, $options)));
+            $responses = (yield \Amp\resolve($this->sendQuestionsToServerOverUdp($server, $questions, $options)));
         }
 
-        yield new CoroutineResult($result);
+        yield new CoroutineResult($responses);
     }
 
-    public function sendQuestionsToServerOverUdpWithTcpFallback(Server $server, $questions, $options)
+    private function sendQuestionsToServerOverUdpWithTcpFallback(Server $server, $questions, $options)
     {
         try {
-            $result = (yield \Amp\resolve($this->sendQuestionsToServerOverUdp($server, $questions, $options)));
+            $responses = (yield \Amp\resolve($this->sendQuestionsToServerOverUdp($server, $questions, $options)));
 
             if (!$server->haveEstablishedTcpSocket && !$server->tcpConnectFailed) {
                 // we know the server is there, try and initiate a TCP connection we can use for future requests
@@ -366,12 +363,11 @@ class DefaultResolver implements Resolver
                 $server->connectTcpSocket();
             }
         } catch (\Exception $e) {
-            echo $e;
             /* todo: may need some handling of specific exceptions? */
-            $result = (yield \Amp\resolve($this->sendQuestionsToServerOverTcp($server, $questions, $options)));
+            $responses = (yield \Amp\resolve($this->sendQuestionsToServerOverTcp($server, $questions, $options)));
         }
 
-        yield new CoroutineResult($result);
+        yield new CoroutineResult($responses);
     }
 
     /**
@@ -396,14 +392,14 @@ class DefaultResolver implements Resolver
             throw new SocketException('Error creating UDP socket for IPv4 communication');
         }
 
-        \stream_set_blocking($this->udpSockets[STREAM_PF_INET], 0);
+        \stream_set_blocking($this->udpSockets[STREAM_PF_INET], false);
         \Amp\onReadable($this->udpSockets[STREAM_PF_INET], $this->makePrivateCallable('onIPv4UdpReadable'));
         $this->udpWritableCallbacks[STREAM_PF_INET] = function() { $this->onUdpWritable(STREAM_PF_INET); };
 
         // Don't throw if we can't create an IPv6 socket, as some machines may not support it
         if ($socket = @\stream_socket_server('udp://[::]:' . $port, $errNo, $errStr, STREAM_SERVER_BIND) ?: null) {
             $this->udpSockets[STREAM_PF_INET6] = $socket;
-            \stream_set_blocking($this->udpSockets[STREAM_PF_INET6], 0);
+            \stream_set_blocking($this->udpSockets[STREAM_PF_INET6], false);
             \Amp\onReadable($this->udpSockets[STREAM_PF_INET6], $this->makePrivateCallable('onIPv6UdpReadable'));
             $this->udpWritableCallbacks[STREAM_PF_INET6] = function() { $this->onUdpWritable(STREAM_PF_INET6); };
         }
@@ -431,7 +427,6 @@ class DefaultResolver implements Resolver
 
     private function onIPv4UdpReadable()
     {
-        var_dump(__METHOD__);
         $packet = \stream_socket_recvfrom($this->udpSockets[STREAM_PF_INET], 1024, 0, $address);
 
         $this->servers[$address]->finalizeUdpRequest($this->decoder->decode($packet));
@@ -463,11 +458,55 @@ class DefaultResolver implements Resolver
         $this->udpWriteWatchers[$addressFamily] = null;
     }
 
+    private function onSystemServerConfigLoaded($error, $result, Deferred $deferred)
+    {
+        if ($error) {
+            $deferred->fail($error);
+            return;
+        }
+
+        if (empty($result['nameservers'])) {
+            $deferred->fail(new ResolutionException('No valid nameserver specified in system config'));
+            return;
+        }
+
+        $this->systemServerConfig = $result;
+
+        foreach ($result['nameservers'] as $host) {
+            if (!$ipAddr = \inet_pton($host)) {
+                continue;
+            }
+
+            if (!isset($ipAddr[4])) {
+                $addressFamily = STREAM_PF_INET;
+            } else if (!isset($this->udpSockets[STREAM_PF_INET6])) {
+                continue; // we were unable to bind an IPv6 socket so ignore IPv6 servers
+            } else {
+                $host = "[{$host}]";
+                $addressFamily = STREAM_PF_INET6;
+            }
+
+            $key = "{$host}:53";
+            $this->defaultServerList[$key] = [
+                'server'    => $this->getServer($key, $addressFamily, $result['timeout']),
+                'protocols' => Server::PROTOCOL_ANY,
+                'key'       => $key,
+            ];
+        }
+
+        if (empty($this->defaultServerList)) {
+            $deferred->fail(new ResolutionException('No valid nameserver specified in system config'));
+            return;
+        }
+
+        $deferred->succeed($this->defaultServerList);
+    }
+
     private function getServerListForRequest($options)
     {
         if (!empty($options['server'])) {
             try {
-                return new Success([$this->parseCustomServerUri($options['server'])]);
+                return new Success([$this->parseCustomServerUri($options)]);
             } catch (\Exception $e) {
                 return new Failure($e);
             }
@@ -480,44 +519,7 @@ class DefaultResolver implements Resolver
         $deferred = new Deferred;
 
         $this->loadSystemServerConfig()->when(function($error, $result) use($deferred) {
-            if ($error) {
-                $deferred->fail($error);
-            } else if (empty($result['nameservers'])) {
-                $deferred->fail(new ResolutionException('No valid nameserver specified in system config'));
-            } else {
-                $this->systemServerConfig = $result;
-
-                foreach ($result['nameservers'] as $host) {
-                    if (!$ipAddr = \inet_pton($host)) {
-                        continue;
-                    }
-
-                    if (isset($ipAddr[4])) {
-                        if (!isset($this->udpSockets[STREAM_PF_INET6])) {
-                            // we were unable to bind an IPv6 socket so ignore IPv6 servers
-                            continue;
-                        }
-
-                        $host = "[{$host}]";
-                        $addressFamily = STREAM_PF_INET6;
-                    } else {
-                        $addressFamily = STREAM_PF_INET;
-                    }
-
-                    $key = "{$host}:53";
-                    $this->defaultServerList[$key] = [
-                        'server'    => $this->getServer($key, $addressFamily),
-                        'protocols' => Server::PROTOCOL_ANY,
-                        'key'       => $key,
-                    ];
-                }
-
-                if (empty($this->defaultServerList)) {
-                    $deferred->fail(new ResolutionException('No valid nameserver specified in system config'));
-                } else {
-                    $deferred->succeed($this->defaultServerList);
-                }
-            }
+            $this->onSystemServerConfigLoaded($error, $result, $deferred);
         });
 
         return $deferred->promise();
@@ -562,12 +564,14 @@ class DefaultResolver implements Resolver
     private function flattenResults($promise, array $types) {
         return \Amp\pipe($promise, function (array $result) use ($types) {
             $retval = [];
+
             foreach ($types as $type) {
                 if (isset($result[$type])) {
                     $retval = \array_merge($retval, $result[$type]);
                     unset($result[$type]);
                 }
             }
+
             return $result ? \array_merge($retval, \call_user_func_array("array_merge", $result)) : $retval;
         });
     }
@@ -740,8 +744,13 @@ class DefaultResolver implements Resolver
         yield new CoroutineResult($data);
     }
 
-    private function parseCustomServerUri($uri)
+    private function parseCustomServerUri($options)
     {
+        $uri = $options['server'];
+        $defaultTimeout = isset($options['timeout'])
+            ? (int)$options['timeout']
+            : $this->defaultServerConfig['timeout'];
+
         if (!\is_string($uri)) {
             throw new ResolutionException(
                 'Invalid server address ($uri must be a string IP address, ' . gettype($uri) . " given)"
@@ -775,9 +784,9 @@ class DefaultResolver implements Resolver
                 throw new ResolutionException('Binding local IPv6 socket failed, unable to use IPv6 server address');
             }
 
+            $host = "[{$host}]";
             $addressFamily = STREAM_PF_INET6;
         } else {
-            $host = "[{$host}]";
             $addressFamily = STREAM_PF_INET;
         }
 
@@ -790,10 +799,15 @@ class DefaultResolver implements Resolver
         }
 
         return [
-            'server'    => $this->getServer("{$host}:{$port}", $addressFamily),
+            'server'    => $this->getServer("{$host}:{$port}", $addressFamily, $defaultTimeout),
             'protocols' => $protocols,
             'key'       => null
         ];
+    }
+
+    private function makePrivateCallable($method)
+    {
+        return (new \ReflectionClass($this))->getMethod($method)->getClosure($this);
     }
 
     /**
@@ -1166,9 +1180,5 @@ class DefaultResolver implements Resolver
             }
             $promisor->succeed($result);
         }
-    }
-
-    private function makePrivateCallable($method) {
-        return (new \ReflectionClass($this))->getMethod($method)->getClosure($this);
     }
 }
