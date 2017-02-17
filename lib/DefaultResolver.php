@@ -4,7 +4,6 @@ namespace Amp\Dns;
 
 use Amp\Cache\ArrayCache;
 use Amp\Cache\Cache;
-use Amp\CombinatorException;
 use Amp\CoroutineResult;
 use Amp\Deferred;
 use Amp\Failure;
@@ -17,7 +16,6 @@ use LibDNS\Decoder\DecoderFactory;
 use LibDNS\Encoder\EncoderFactory;
 use LibDNS\Messages\Message;
 use LibDNS\Messages\MessageFactory;
-use LibDNS\Messages\MessageTypes;
 use LibDNS\Records\QuestionFactory;
 use LibDNS\Records\Resource as ResourceRecord;
 
@@ -27,33 +25,29 @@ class DefaultResolver implements Resolver
     const HOSTS_FILE_PATH = '/etc/hosts';
     const HOSTS_FILE_PATH_WIN = 'C:\Windows\system32\drivers\etc\hosts';
 
+    private static $isWindows;
+
     private $defaultServerConfig = [
         "nameservers" => [
             "8.8.8.8",
             "8.8.4.4",
         ],
-        "timeout" => 3000,
-        "attempts" => 2,
+        Option::REQUEST_TIMEOUT  => DEFAULT_REQUEST_TIMEOUT,
+        Option::REQUEST_ATTEMPTS => DEFAULT_REQUEST_ATTEMPTS,
     ];
-
-    private static $isWindows;
 
     private $messageFactory;
     private $questionFactory;
     private $encoder;
     private $decoder;
     private $cache;
-    private $requestIdCounter;
-    private $pendingRequests;
-    private $serverIdMap;
-    private $serverUriMap;
-    private $serverIdTimeoutMap;
-    private $now;
-    private $serverTimeoutWatcher;
+
     private $systemServerConfig;
     private $systemServerConfigLoadPromise;
+
     private $hostsFileData;
     private $hostsFileLoadPromise;
+
     private $udpSockets = [];
     private $udpWriteQueues = [];
     private $udpWritableCallbacks = [];
@@ -64,11 +58,11 @@ class DefaultResolver implements Resolver
     /** @var Server[] */
     private $servers = [];
 
-    private function getServer($address, $addressFamily, $defaultTimeout)
+    private function getServer($address, $addressFamily, $options)
     {
         if (!isset($this->servers[$address])) {
             $this->servers[$address] = new Server(
-                $address, $addressFamily, $defaultTimeout,
+                $address, $addressFamily, $options,
                 $this->messageFactory, $this->encoder, $this->decoder
             );
         }
@@ -78,32 +72,14 @@ class DefaultResolver implements Resolver
 
     public function __construct(Cache $cache = null)
     {
+        self::$isWindows = \stripos(PHP_OS, "win") === 0;
+
         $this->messageFactory = new MessageFactory;
         $this->questionFactory = new QuestionFactory;
         $this->encoder = (new EncoderFactory)->create();
         $this->decoder = (new DecoderFactory)->create(null, true);
         $this->cache = isset($cache) ? $cache : new ArrayCache;
-        $this->requestIdCounter = 1;
-        $this->pendingRequests = [];
-        $this->serverIdMap = [];
-        $this->serverUriMap = [];
-        $this->serverIdTimeoutMap = [];
-        $this->now = \time();
-        $this->serverTimeoutWatcher = \Amp\repeat(function ($watcherId) {
-            $this->now = $now = \time();
-            foreach ($this->serverIdTimeoutMap as $id => $expiry) {
-                if ($now > $expiry) {
-                    $this->unloadServer($id);
-                }
-            }
-            if (empty($this->serverIdMap)) {
-                \Amp\disable($watcherId);
-            }
-        }, 1000, $options = [
-            "enable" => true,
-            "keep_alive" => false,
-        ]);
-        self::$isWindows = \stripos(PHP_OS, "win") === 0;
+
         $this->createUdpSockets();
     }
 
@@ -151,11 +127,6 @@ class DefaultResolver implements Resolver
      */
     public function query($name, $type, array $options = [])
     {
-        return $this->flattenResults(\Amp\resolve(
-            empty($options['recurse'])
-                ? $this->doResolve(strtolower($name), [$type], $options)
-                : $this->doRecurse(strtolower($name), [$type], $options)
-        ), [$type]);
     }
 
     private function resolveName($name, $types, $options)
@@ -194,17 +165,17 @@ class DefaultResolver implements Resolver
 
         foreach ((yield $this->getServerListForRequest($options)) as $serverInfo) {
             try {
+                /** @var Server $server */
                 $server = $serverInfo['server'];
                 $protocols = $serverInfo['protocols'];
-                $key = $serverInfo['key'];
 
                 /** @var Message[] $results */
                 $results = (yield \Amp\resolve($this->sendQuestionsToServer($server, $protocols, $questions, $options)));
             } catch (\Exception $e) {
                 // if a request fails for one of the system default servers, move it to the end of the list
-                if ($key !== null) {
-                    unset($this->defaultServerList[$key]);
-                    $this->defaultServerList[$key] = $serverInfo;
+                if ($server->isSystemServer) {
+                    unset($this->defaultServerList[$server->address]);
+                    $this->defaultServerList[$server->address] = $serverInfo;
                 }
 
                 continue;
@@ -270,14 +241,14 @@ class DefaultResolver implements Resolver
         unset($questions[$firstKey]);
 
         list($request, $promise) = $server->buildUdpRequest($firstQuestion);
-        $this->sendUdpMessage($request, $server);
+        $this->enqueueUdpMessageForSending($request, $server);
 
         $responses = [];
 
         try {
             $timeout = !empty($options['timeout'])
                 ? (int)$options['timeout']
-                : $server->defaultTimeout;
+                : $server->defaultRequestTimeout;
 
             $responses[$firstKey] = (yield \Amp\timeout($promise, $timeout));
         } catch (AmpTimeoutException $e) {
@@ -302,8 +273,8 @@ class DefaultResolver implements Resolver
 
         foreach ($questions as $key => $question) {
             list($request, $promise) = $server->buildUdpRequest($question);
-            $this->sendUdpMessage($request, $server);
 
+            $this->enqueueUdpMessageForSending($request, $server);
             $promises[$key] = $promise;
         }
 
@@ -324,18 +295,14 @@ class DefaultResolver implements Resolver
         }
 
         if (!$server->haveEstablishedTcpSocket) {
-            yield $server->connectTcpSocket();
+            yield $server->connectTcpSocket($options);
         }
 
-        try {
-            $timeout = !empty($options['timeout'])
-                ? (int)$options['timeout']
-                : $server->defaultTimeout;
+        $timeout = !empty($options['timeout'])
+            ? (int)$options['timeout']
+            : $server->defaultRequestTimeout;
 
-            $responses = (yield $server->sendTcpRequest($questions, $timeout));
-        } catch (AmpTimeoutException $e) {
-            throw new TimeoutException('Request timed out after ' . $timeout . 'ms');
-        }
+        $responses = (yield $server->sendTcpRequest($questions, $timeout));
 
         yield new CoroutineResult($responses);
     }
@@ -345,7 +312,6 @@ class DefaultResolver implements Resolver
         try {
             $responses = (yield \Amp\resolve($this->sendQuestionsToServerOverTcp($server, $questions, $options)));
         } catch (\Exception $e) {
-            /* todo: may need some handling of specific exceptions? */
             $responses = (yield \Amp\resolve($this->sendQuestionsToServerOverUdp($server, $questions, $options)));
         }
 
@@ -354,16 +320,19 @@ class DefaultResolver implements Resolver
 
     private function sendQuestionsToServerOverUdpWithTcpFallback(Server $server, $questions, $options)
     {
+        $responses = [];
+
         try {
             $responses = (yield \Amp\resolve($this->sendQuestionsToServerOverUdp($server, $questions, $options)));
 
             if (!$server->haveEstablishedTcpSocket && !$server->tcpConnectFailed) {
                 // we know the server is there, try and initiate a TCP connection we can use for future requests
                 // but don't wait for it, we don't need it right now
-                $server->connectTcpSocket();
+                $server->connectTcpSocket($options);
             }
+        } catch (SocketConnectFailedException $e) {
+            // ignore this, we have the results we need already
         } catch (\Exception $e) {
-            /* todo: may need some handling of specific exceptions? */
             $responses = (yield \Amp\resolve($this->sendQuestionsToServerOverTcp($server, $questions, $options)));
         }
 
@@ -377,8 +346,10 @@ class DefaultResolver implements Resolver
      */
     private function createUdpSockets()
     {
-        // A single socket is use for all UDP communication (one each for IPv4 and IPv6)
-        // UDP socket creation is an atomic operation, no benefit to STREAM_CLIENT_ASYNC_CONNECT
+        // A single socket is use for all UDP communication (one each for IPv4 and IPv6). In order to do this, we need
+        // to use stream_socket_server() instead of stream_socket_client(). With servers there's no way that I can find
+        // to have the OS choose a port for us, so we do that ourselves. Since this is only ever done once, it doesn't
+        // have a meaningful performance impact.
 
         // Try and find a port that we can bind to
         for ($port = 56211; $port > 40000; $port--) {
@@ -389,7 +360,7 @@ class DefaultResolver implements Resolver
         }
 
         if (!$this->udpSockets[STREAM_PF_INET]) {
-            throw new SocketException('Error creating UDP socket for IPv4 communication');
+            throw new SocketConnectFailedException('Error creating UDP socket for IPv4 communication');
         }
 
         \stream_set_blocking($this->udpSockets[STREAM_PF_INET], false);
@@ -405,17 +376,13 @@ class DefaultResolver implements Resolver
         }
     }
 
-    private function sendUdpMessage(Message $message, Server $server)
+    private function enqueueUdpMessageForSending(Message $message, Server $server)
     {
         $addressFamily = $server->addressFamily;
         $data = $this->encoder->encode($message);
         $length = \strlen($data);
 
-        if (\stream_socket_sendto($this->udpSockets[$addressFamily], $data, 0, $server->address) === $length) {
-            return;
-        }
-
-        $this->udpWriteQueues[$addressFamily][] = [$data, $length, $server->address];
+        $this->udpWriteQueues[$addressFamily][] = [$data, $length, $message->getID(), $server];
 
         if (!isset($this->udpWriteWatchers[$addressFamily])) {
             $this->udpWriteWatchers[$addressFamily] = \Amp\onWritable(
@@ -429,7 +396,7 @@ class DefaultResolver implements Resolver
     {
         $packet = \stream_socket_recvfrom($this->udpSockets[STREAM_PF_INET], 1024, 0, $address);
 
-        $this->servers[$address]->finalizeUdpRequest($this->decoder->decode($packet));
+        $this->servers[$address]->finalizeSuccessfulUdpRequest($this->decoder->decode($packet));
     }
 
     private function onIPv6UdpReadable()
@@ -439,15 +406,17 @@ class DefaultResolver implements Resolver
         $portPos = \strrpos($address, ':');
         $address = '[' . \substr($address, 0, $portPos) . ']' . \substr($address, $portPos);
 
-        $this->servers[$address]->finalizeUdpRequest($this->decoder->decode($packet));
+        $this->servers[$address]->finalizeSuccessfulUdpRequest($this->decoder->decode($packet));
     }
 
     private function onUdpWritable($addressFamily)
     {
         while ($this->udpWriteQueues[$addressFamily]) {
-            list($data, $length, $serverAddress) = $this->udpWriteQueues[$addressFamily][0];
+            /** @var Server $server */
+            list($data, $length, $messageId, $server) = $this->udpWriteQueues[$addressFamily][0];
 
-            if (\stream_socket_sendto($this->udpSockets[$addressFamily], $data, 0, $serverAddress) !== $length) {
+            if (\stream_socket_sendto($this->udpSockets[$addressFamily], $data, 0, $server->address) !== $length) {
+                $server->finalizeFailedUdpRequest($messageId, new SocketWriteFailedException('UDP write failed'));
                 return;
             }
 
@@ -486,11 +455,15 @@ class DefaultResolver implements Resolver
                 $addressFamily = STREAM_PF_INET6;
             }
 
-            $key = "{$host}:53";
-            $this->defaultServerList[$key] = [
-                'server'    => $this->getServer($key, $addressFamily, $result['timeout']),
+            $address = "{$host}:53";
+            $this->defaultServerList[$address] = [
+                'server' => $this->getServer($address, $addressFamily, [
+                    Server::OP_IS_SYSTEM_SERVER => true,
+                    Option::REQUEST_TIMEOUT     => $result[Option::REQUEST_TIMEOUT],
+                    Option::TCP_CONNECT_TIMEOUT => DEFAULT_TCP_CONNECT_TIMEOUT,
+                    Option::TCP_IDLE_TIMEOUT    => DEFAULT_TCP_IDLE_TIMEOUT,
+                ]),
                 'protocols' => Server::PROTOCOL_ANY,
-                'key'       => $key,
             ];
         }
 
@@ -583,6 +556,11 @@ class DefaultResolver implements Resolver
      */
     private function loadResolvConf($path)
     {
+        static $mappedOptions = [
+            'timeout' => Option::REQUEST_TIMEOUT,
+            'attempts' => Option::REQUEST_ATTEMPTS,
+        ];
+
         $result = $this->defaultServerConfig;
 
         try {
@@ -611,11 +589,10 @@ class DefaultResolver implements Resolver
                         continue;
                     }
 
-                    // TODO: Respect the contents of the attempts setting during resolution
-
                     list($option, $value) = $optline;
-                    if (in_array($option, ["timeout", "attempts"])) {
-                        $result[$option] = (int) $value;
+
+                    if (isset($mappedOptions[$option])) {
+                        $result[$mappedOptions[$option]] = (int)$value;
                     }
                 }
             }
@@ -747,15 +724,27 @@ class DefaultResolver implements Resolver
     private function parseCustomServerUri($options)
     {
         $uri = $options['server'];
-        $defaultTimeout = isset($options['timeout'])
-            ? (int)$options['timeout']
-            : $this->defaultServerConfig['timeout'];
 
         if (!\is_string($uri)) {
             throw new ResolutionException(
                 'Invalid server address ($uri must be a string IP address, ' . gettype($uri) . " given)"
             );
         }
+
+        if (!empty($options['request_timeout'])) {
+            $defaultRequestTimeout = (int)$options['request_timeout'];
+        } else if (!empty($options['timeout'])) { // backwards compat
+            $defaultRequestTimeout = (int)$options['timeout'];
+        } else {
+            $defaultRequestTimeout = $this->defaultServerConfig['request_timeout'];
+        }
+
+        $tcpConnectTimeout = !empty($options['tcp_connect_timeout'])
+            ? (int)$options['tcp_connect_timeout']
+            : DEFAULT_TCP_CONNECT_TIMEOUT;
+        $tcpIdleTimeout = !empty($options['tcp_idle_timeout'])
+            ? (int)$options['tcp_idle_timeout']
+            : DEFAULT_TCP_IDLE_TIMEOUT;
 
         $parts = explode('://', $uri);
 
@@ -799,386 +788,18 @@ class DefaultResolver implements Resolver
         }
 
         return [
-            'server'    => $this->getServer("{$host}:{$port}", $addressFamily, $defaultTimeout),
+            'server' => $this->getServer("{$host}:{$port}", $addressFamily, [
+                Server::OP_IS_SYSTEM_SERVER => false,
+                Option::REQUEST_TIMEOUT     => $defaultRequestTimeout,
+                Option::TCP_CONNECT_TIMEOUT => $tcpConnectTimeout,
+                Option::TCP_IDLE_TIMEOUT    => $tcpIdleTimeout,
+            ]),
             'protocols' => $protocols,
-            'key'       => null
         ];
     }
 
     private function makePrivateCallable($method)
     {
         return (new \ReflectionClass($this))->getMethod($method)->getClosure($this);
-    }
-
-    /**
-     * @todo
-     * below this point is old stuff that I have not touched. Some of it is redundant, some of it needs to be
-     * reimplemented, some of it just needs killing.
-     */
-
-    private function doRecurse($name, array $types, $options) {
-        if (array_intersect($types, [Record::CNAME, Record::DNAME])) {
-            throw new ResolutionException("Cannot use recursion for CNAME and DNAME records");
-        }
-
-        $types = array_merge($types, [Record::CNAME, Record::DNAME]);
-        $lookupName = $name;
-        for ($i = 0; $i < 30; $i++) {
-            $result = (yield \Amp\resolve($this->doResolve($lookupName, $types, $options)));
-            if (count($result) > isset($result[Record::CNAME]) + isset($result[Record::DNAME])) {
-                unset($result[Record::CNAME], $result[Record::DNAME]);
-                yield new CoroutineResult($result);
-                return;
-            }
-            // @TODO check for potentially using recursion and iterate over *all* CNAME/DNAME
-            // @FIXME check higher level for CNAME?
-            foreach ([Record::CNAME, Record::DNAME] as $type) {
-                if (isset($result[$type])) {
-                    list($lookupName) = $result[$type][0];
-                }
-            }
-        }
-
-        throw new ResolutionException("CNAME or DNAME chain too long (possible recursion?)");
-    }
-
-    private function doRequest($uri, $name, $type) {
-        $server = $this->loadExistingServer($uri) ?: $this->loadNewServer($uri);
-
-        $useTCP = substr($uri, 0, 6) == "tcp://";
-        if ($useTCP && isset($server->connect)) {
-            return \Amp\pipe($server->connect, function() use ($uri, $name, $type) {
-                return $this->doRequest($uri, $name, $type);
-            });
-        }
-
-        // Get the next available request ID
-        do {
-            $requestId = $this->requestIdCounter++;
-            if ($this->requestIdCounter >= MAX_REQUEST_ID) {
-                $this->requestIdCounter = 1;
-            }
-        } while (isset($this->pendingRequests[$requestId]));
-
-        // Create question record
-        $question = $this->questionFactory->create($type);
-        $question->setName($name);
-
-        // Create request message
-        $request = $this->messageFactory->create(MessageTypes::QUERY);
-        $request->getQuestionRecords()->add($question);
-        $request->isRecursionDesired(true);
-        $request->setID($requestId);
-
-        // Encode request message
-        $requestPacket = $this->encoder->encode($request);
-
-        if ($useTCP) {
-            $requestPacket = pack("n", strlen($requestPacket)) . $requestPacket;
-        }
-
-        // Send request
-        $bytesWritten = \fwrite($server->socket, $requestPacket);
-        if ($bytesWritten === false || isset($packet[$bytesWritten])) {
-            throw new ResolutionException(
-                "Request send failed"
-            );
-        }
-
-        $promisor = new Deferred;
-        $server->pendingRequests[$requestId] = true;
-        $this->pendingRequests[$requestId] = [$promisor, $name, $type, $uri];
-
-        return $promisor->promise();
-    }
-
-    private function doResolve($name, array $types, $options) {
-        if (!$this->systemServerConfig) {
-            $this->systemServerConfig = (yield \Amp\resolve($this->loadSystemServerConfig()));
-        }
-
-        if (empty($types)) {
-            yield new CoroutineResult([]);
-            return;
-        }
-
-        assert(array_reduce($types, function ($result, $val) { return $result && \is_int($val); }, true), 'The $types passed to DNS functions must all be integers (from \Amp\Dns\Record class)');
-
-        $name = \strtolower($name);
-        $result = [];
-
-        // Check for cache hits
-        if (!isset($options["cache"]) || $options["cache"]) {
-            foreach ($types as $k => $type) {
-                $cacheKey = "$name#$type";
-                $cacheValue = (yield $this->cache->get($cacheKey));
-
-                if ($cacheValue !== null) {
-                    $result[$type] = $cacheValue;
-                    unset($types[$k]);
-                }
-            }
-            if (empty($types)) {
-                if (empty(array_filter($result))) {
-                    throw new NoRecordException("No records returned for {$name} (cached result)");
-                } else {
-                    yield new CoroutineResult($result);
-                    return;
-                }
-            }
-        }
-
-        $timeout = empty($options["timeout"]) ? $this->systemServerConfig["timeout"] : (int) $options["timeout"];
-
-        if (empty($options["server"])) {
-            if (empty($this->systemServerConfig["nameservers"])) {
-                throw new ResolutionException("No nameserver specified in system config");
-            }
-
-            $uri = "udp://" . $this->systemServerConfig["nameservers"][0];
-        } else {
-            $uri = $this->parseCustomServerUri($options["server"]);
-        }
-
-        $promises = [];
-
-        foreach ($types as $type) {
-            $promises[] = $this->doRequest($uri, $name, $type);
-        }
-
-        try {
-            list( , $resultArr) = (yield \Amp\timeout(\Amp\some($promises), $timeout));
-            foreach ($resultArr as $value) {
-                $result += $value;
-            }
-        } catch (TimeoutException $e) {
-            if (substr($uri, 0, 6) == "tcp://") {
-                throw new TimeoutException(
-                    "Name resolution timed out for {$name}"
-                );
-            } else {
-                $options["server"] = \preg_replace("#[a-z.]+://#", "tcp://", $uri);
-                yield new CoroutineResult(\Amp\resolve($this->doResolve($name, $types, $options)));
-                return;
-            }
-        } catch (ResolutionException $e) {
-            if (empty($result)) { // if we have no cached results
-                throw $e;
-            }
-        } catch (CombinatorException $e) { // if all promises in Amp\some fail
-            if (empty($result)) { // if we have no cached results
-                foreach ($e->getExceptions() as $ex) {
-                    if ($ex instanceof NoRecordException) {
-                        throw new NoRecordException("No records returned for {$name}", 0, $e);
-                    }
-                }
-                throw new ResolutionException("All name resolution requests failed", 0, $e);
-            }
-        }
-
-        yield new CoroutineResult($result);
-    }
-
-    private function loadExistingServer($uri) {
-        if (empty($this->serverUriMap[$uri])) {
-            return null;
-        }
-
-        $server = $this->serverUriMap[$uri];
-
-        if (\is_resource($server->socket)) {
-            unset($this->serverIdTimeoutMap[$server->id]);
-            \Amp\enable($server->watcherId);
-            return $server;
-        }
-
-        $this->unloadServer($server->id);
-        return null;
-    }
-
-    private function loadNewServer($uri) {
-        if (!$socket = @\stream_socket_client($uri, $errno, $errstr, 0, STREAM_CLIENT_ASYNC_CONNECT)) {
-            throw new ResolutionException(sprintf(
-                "Connection to %s failed: [Error #%d] %s",
-                $uri,
-                $errno,
-                $errstr
-            ));
-        }
-
-        \stream_set_blocking($socket, false);
-        $id = (int) $socket;
-        $server = new \StdClass;
-        $server->id = $id;
-        $server->uri = $uri;
-        $server->socket = $socket;
-        $server->buffer = "";
-        $server->length = INF;
-        $server->pendingRequests = [];
-        $server->watcherId = \Amp\onReadable($socket, $this->makePrivateCallable("onReadable"), [
-            "enable" => true,
-            "keep_alive" => true,
-        ]);
-        $this->serverIdMap[$id] = $server;
-        $this->serverUriMap[$uri] = $server;
-
-        if (substr($uri, 0, 6) == "tcp://") {
-            $promisor = new Deferred;
-            $server->connect = $promisor->promise();
-            $watcher = \Amp\onWritable($server->socket, static function($watcher) use ($server, $promisor, &$timer) {
-                \Amp\cancel($watcher);
-                \Amp\cancel($timer);
-                unset($server->connect);
-                $promisor->succeed();
-            });
-            $timer = \Amp\once(function() use ($id, $promisor, $watcher, $uri) {
-                \Amp\cancel($watcher);
-                $this->unloadServer($id);
-                $promisor->fail(new TimeoutException("Name resolution timed out, could not connect to server at $uri"));
-            }, 5000);
-        }
-
-        return $server;
-    }
-
-    private function unloadServer($serverId, $error = null) {
-        // Might already have been unloaded (especially if multiple requests happen)
-        if (!isset($this->serverIdMap[$serverId])) {
-            return;
-        }
-
-        $server = $this->serverIdMap[$serverId];
-        \Amp\cancel($server->watcherId);
-        unset(
-            $this->serverIdMap[$serverId],
-            $this->serverUriMap[$server->uri]
-        );
-        if (\is_resource($server->socket)) {
-            @\fclose($server->socket);
-        }
-        if ($error && $server->pendingRequests) {
-            foreach (array_keys($server->pendingRequests) as $requestId) {
-                list($promisor) = $this->pendingRequests[$requestId];
-                $promisor->fail($error);
-            }
-        }
-    }
-
-    private function onReadable($watcherId, $socket) {
-        $serverId = (int) $socket;
-        $packet = @\fread($socket, 512);
-        if ($packet != "") {
-            $server = $this->serverIdMap[$serverId];
-            if (\substr($server->uri, 0, 6) == "tcp://") {
-                if ($server->length == INF) {
-                    $server->length = unpack("n", $packet)[1];
-                    $packet = substr($packet, 2);
-                }
-                $server->buffer .= $packet;
-                while ($server->length <= \strlen($server->buffer)) {
-                    $this->decodeResponsePacket($serverId, substr($server->buffer, 0, $server->length));
-                    $server->buffer = substr($server->buffer, $server->length);
-                    if (\strlen($server->buffer) >= 2 + $server->length) {
-                        $server->length = unpack("n", $server->buffer)[1];
-                        $server->buffer = substr($server->buffer, 2);
-                    } else {
-                        $server->length = INF;
-                    }
-                }
-            } else {
-                $this->decodeResponsePacket($serverId, $packet);
-            }
-        } else {
-            $this->unloadServer($serverId, new ResolutionException(
-                "Server connection failed"
-            ));
-        }
-    }
-
-    private function decodeResponsePacket($serverId, $packet) {
-        try {
-            $response = $this->decoder->decode($packet);
-            $requestId = $response->getID();
-            $responseCode = $response->getResponseCode();
-            $responseType = $response->getType();
-
-            if ($responseCode !== 0) {
-                $this->finalizeResult($serverId, $requestId, new ResolutionException(
-                    "Server returned error code: {$responseCode}"
-                ));
-            } elseif ($responseType !== MessageTypes::RESPONSE) {
-                $this->unloadServer($serverId, new ResolutionException(
-                    "Invalid server reply; expected RESPONSE but received QUERY"
-                ));
-            } else {
-                $this->processDecodedResponse($serverId, $requestId, $response);
-            }
-        } catch (\Exception $e) {
-            $this->unloadServer($serverId, new ResolutionException(
-                "Response decode error", 0, $e
-            ));
-        }
-    }
-
-    private function processDecodedResponse($serverId, $requestId, $response) {
-        list($promisor, $name, $type, $uri) = $this->pendingRequests[$requestId];
-
-        // Retry via tcp if message has been truncated
-        if ($response->isTruncated()) {
-            if (\substr($uri, 0, 6) != "tcp://") {
-                $uri = \preg_replace("#[a-z.]+://#", "tcp://", $uri);
-                $promisor->succeed($this->doRequest($uri, $name, $type));
-            } else {
-                $this->finalizeResult($serverId, $requestId, new ResolutionException(
-                    "Server returned truncated response"
-                ));
-            }
-            return;
-        }
-
-        $answers = $response->getAnswerRecords();
-        foreach ($answers as $record) {
-            $result[$record->getType()][] = [(string) $record->getData(), $record->getType(), $record->getTTL()];
-        }
-        if (empty($result)) {
-            $this->cache->set("$name#$type", [], 300); // "it MUST NOT cache it for longer than five (5) minutes" per RFC 2308 section 7.1
-            $this->finalizeResult($serverId, $requestId, new NoRecordException(
-                "No records returned for {$name}"
-            ));
-        } else {
-            $this->finalizeResult($serverId, $requestId, $error = null, $result);
-        }
-    }
-
-    private function finalizeResult($serverId, $requestId, $error = null, $result = null) {
-        if (empty($this->pendingRequests[$requestId])) {
-            return;
-        }
-
-        list($promisor, $name) = $this->pendingRequests[$requestId];
-        $server = $this->serverIdMap[$serverId];
-        unset(
-            $this->pendingRequests[$requestId],
-            $server->pendingRequests[$requestId]
-        );
-        if (empty($server->pendingRequests)) {
-            $this->serverIdTimeoutMap[$server->id] = $this->now + IDLE_TIMEOUT;
-            \Amp\disable($server->watcherId);
-            \Amp\enable($this->serverTimeoutWatcher);
-        }
-        if ($error) {
-            $promisor->fail($error);
-        } else {
-            foreach ($result as $type => $records) {
-                $minttl = INF;
-                foreach ($records as list( , $ttl)) {
-                    if ($ttl && $minttl > $ttl) {
-                        $minttl = $ttl;
-                    }
-                }
-                $this->cache->set("$name#$type", $records, $minttl);
-            }
-            $promisor->succeed($result);
-        }
     }
 }
