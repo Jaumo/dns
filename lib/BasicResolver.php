@@ -51,6 +51,10 @@ final class BasicResolver implements Resolver {
         $this->questionFactory = new QuestionFactory;
 
         $this->gcWatcher = Loop::repeat(5000, function () {
+            if (empty($this->servers)) {
+                return;
+            }
+
             $now = \time();
 
             foreach ($this->servers as $key => $server) {
@@ -183,22 +187,19 @@ final class BasicResolver implements Resolver {
 
             $nameservers = $this->config->getNameservers();
             $attempts = $this->config->getAttempts();
-            $receivedTruncatedResponse = false;
+            $attempt = 0;
+            $protocol = "udp";
 
-            for ($attempt = 0; $attempt < $attempts; ++$attempt) {
-                $i = $attempt % \count($nameservers);
-                $protocol = $receivedTruncatedResponse ? "tcp" : "udp";
+            /** @var \Amp\Dns\Server $server */
+            $server = yield $this->getServer($protocol . "://" . $nameservers[0]);
 
+            while ($attempt < $attempts) {
                 try {
-                    /** @var \Amp\Dns\Server $server */
-                    $server = yield $this->getServer($protocol . "://" . $nameservers[$i]);
-
                     if (!$server->isAlive()) {
-                        $this->servers[$protocol . "://" . $nameservers[$i]]->close();
-                        unset($this->servers[$protocol . "://" . $nameservers[$i]]);
+                        $server->close();
 
                         /** @var \Amp\Dns\Server $server */
-                        $server = yield $this->getServer($protocol . "://" . $nameservers[$i]);
+                        $server = yield $this->getServer($protocol . "://" . $nameservers[$attempt % \count($nameservers)]);
                     }
 
                     /** @var Message $response */
@@ -206,10 +207,9 @@ final class BasicResolver implements Resolver {
                     $this->assertAcceptableResponse($response);
 
                     if ($response->isTruncated()) {
-                        if (!$receivedTruncatedResponse) {
+                        if ($protocol !== "tcp") {
                             // Retry with TCP, don't count attempt
-                            $receivedTruncatedResponse = true;
-                            $attempt--;
+                            $server = yield $this->getServer("tcp://" . $nameservers[$attempt % \count($nameservers)]);
                             continue;
                         }
 
@@ -243,6 +243,7 @@ final class BasicResolver implements Resolver {
                         return new Record($data, $type, $ttls[$type]);
                     }, $result[$type]);
                 } catch (TimeoutException $e) {
+                    $server = yield $this->getServer("udp://" . $nameservers[++$attempt % \count($nameservers)]);
                     continue;
                 }
             }
@@ -326,6 +327,10 @@ final class BasicResolver implements Resolver {
     }
 
     private function getServer($uri): Promise {
+        if (\substr($uri, 0, 3) === "udp") {
+            return UdpServer::connect($uri);
+        }
+
         if (isset($this->servers[$uri])) {
             return new Success($this->servers[$uri]);
         }
@@ -334,11 +339,7 @@ final class BasicResolver implements Resolver {
             return $this->pendingServers[$uri];
         }
 
-        if (\substr($uri, 0, 3) === "udp") {
-            $server = UdpServer::connect($uri);
-        } else {
-            $server = TcpServer::connect($uri);
-        }
+        $server = TcpServer::connect($uri);
 
         $server->onResolve(function ($error, $server) use ($uri) {
             if ($error) {

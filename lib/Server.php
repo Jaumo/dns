@@ -7,6 +7,7 @@ use Amp\ByteStream\ResourceInputStream;
 use Amp\ByteStream\ResourceOutputStream;
 use Amp\ByteStream\StreamException;
 use Amp\Deferred;
+use Amp\Delayed;
 use Amp\Promise;
 use LibDNS\Messages\Message;
 use LibDNS\Messages\MessageFactory;
@@ -111,15 +112,9 @@ abstract class Server {
         return call(function () use ($question, $timeout) {
             $this->lastActivity = \time();
 
-            $id = $this->nextId++;
-            if ($this->nextId > 0xffff) {
-                $this->nextId %= 0xffff;
-            }
-
-            if (isset($this->questions[$id])) {
-                $deferred = $this->questions[$id];
-                unset($this->questions[$id]);
-                $deferred->fail(new ResolutionException("Request hasn't been answered with 65k requests in between"));
+            $id = \random_int(0, 0xffff);
+            while (isset($this->questions[$id])) {
+                $id = yield new Delayed(100, \random_int(0, 0xffff));
             }
 
             $message = $this->createMessage($question, $id);
